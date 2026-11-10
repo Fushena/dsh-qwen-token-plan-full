@@ -1,0 +1,10 @@
+# Qwen Token Plan 全能路由：动态模型目录 + 服务端内置工具 + 图片/视频生成权益。
+# API Key 只通过 DSH 凭据引用解析，不写入本文件。
+# 权益预算默认开启：每项权益剩余额度 = 官方周期配额 − 本周期调用次数，耗尽即停用。
+- insert:
+    - id: qwen-token-plan-full
+      name: dsh-qwen-token-plan-full
+      config:
+        providerId: qwen-token-plan-full
+        apiKeyEnv: QWEN_TOKEN_PLAN_CN_API_KEY
+        harness: auto
