@@ -2,6 +2,25 @@
 
 按你的 Token Plan（个人版）实际权益重写的 DSH Host 插件，是 `dsh-qwen-token-plan-cn-responses` 的全功能替代品：
 
+## 前置条件与平台支持 / Prerequisites
+
+- **DSH 版本**：针对 DeepSeek Harness **0.2.2-rc.1** 开发与验证；peer 依赖
+  `@deepseek-ai/dsh-llm` / `@deepseek-ai/dsh-credentials` 范围为
+  `^0.2.1-rc.5 || ^0.2.2-rc.1`（0.2.1-rc.5 至 0.2.2-rc.x 均可安装）。
+- **账号**：需要阿里云百炼 **Token Plan 个人版**订阅，并在 Settings → Models 配置凭据引用
+  `QWEN_TOKEN_PLAN_CN_API_KEY`；缺失时请求报 `MISSING_CREDENTIAL`。
+  权益面板的精确余额另需 `BAILIAN_CONSOLE_COOKIE`（`~/.dsh/.env` 或环境变量）；
+  没有它时预算退回「官方周期配额 − 本地计数」的本地估算，功能不失效。
+- **额度自动重登前置**：Cookie 过期后的自动重登流程依赖第三方插件
+  [dsh-chrome-bridge](https://github.com/OrderG-X/dsh-chrome-bridge) 及其 Chrome 扩展。
+  **macOS** 下插件可直接拉起 Chrome 完成重登；**Windows/Linux** 下自动拉起不可用
+  （`lib/relogin.js` 仅 darwin 走 `/usr/bin/open -a Google Chrome`），需手动更新
+  `~/.dsh/.env` 里的 Cookie，或先装 dsh-chrome-bridge 由桥收割。
+- **网络/代理**：大陆网络直连百炼控制台网关可能被 TLS 重置；Node 的 `fetch` 不读系统代理，
+  需配置 `proxy` 或 `HTTPS_PROXY`，见下文「出站代理」专节。
+- **平台**：聊天、动态目录、图片/视频生成、代理支持跨平台（macOS/Windows/Linux）；
+  仅「自动拉起 Chrome 重登」为 macOS 专属，见上。
+
 ## 相对旧插件的改进
 
 | 能力 | 旧插件 0.1.9 | 本插件 |
@@ -10,7 +29,7 @@
 | dsh-llm 协议 | 面向 0.1.x（tool-result 内嵌块），0.2.x 上多轮工具对话会 400 | 面向 0.2.1：`role:"tool"` 独立消息 → `function_call_output` / chat `tool_call_id`，同时兼容 0.1.x 形状 |
 | 图片生成 | 无 | **`qwen_generate_image` 工具**：qwen-image-3.0-pro / wan2.7-image(-pro)，走 Token Plan 计费，自动下载到会话工作目录 |
 | 视频生成 | 无 | **`qwen_generate_video` 工具**：wan3.0-video 异步任务 + 轮询 + 自动下载 mp4；`duration` 3-15 秒（默认 5 秒，Credits 随时长增加） |
-| 版本豁免 | 需要（peerDeps 只到 0.1.x） | 不需要（peerDeps 精确匹配 0.2.1-rc.5） |
+| 版本豁免 | 需要（peerDeps 只到 0.1.x） | 不需要（peerDeps 覆盖 0.2.1-rc.5 至 0.2.2-rc.x） |
 
 聊天能力与旧插件一致：千问/DeepSeek 系走 Responses API（服务端内置工具 web_search、code_interpreter、web_extractor、web_search_image、image_search，`harness: auto` 按模型能力取交集）；GLM 系走 Chat Completions（enable_thinking + reasoning_effort，未知 GLM 自动禁用 none 档，因服务端强制思考）。
 
@@ -107,7 +126,7 @@ Esc 也可关闭。数据同源口径：套餐剩余 = 网关 `per1MonthPercenta
 
 ### 本地验证
 
-在插件目录执行 `npm test`（39 项：compat + relogin + stream）。
+在插件目录执行 `npm test`（47 项：compat + relogin + route-guard + proxy + media + stream）。
 
 **`test/stream.test.js` 必须用真实 HTTP 服务器而不是假流**：超时靠 abort 请求信号生效，真实 undici 收到 abort 会取消 body 并让读取抛错；手写假流不响应 abort，只能测出「定时器到点」，测不出「读取是否真的被中止」。它钉死三条语义：慢但持续的流必须完整读完（超时是**空闲超时**不是总时长，否则长回答会被掐断）、卡死的流要在阈值附近报 TIMEOUT、用户取消要立刻报 ABORTED。
 
@@ -115,4 +134,4 @@ Esc 也可关闭。数据同源口径：套餐剩余 = 网关 `per1MonthPercenta
 
 真实联网验证需单独进行；正常测试不会运行图片或视频生成。
 
-当前修复的验证结果：39 项离线回归测试全部通过（含真实 SSE 服务器上的超时/取消端到端用例）；本机 DSH 桌面配置可完整加载，四个 agent 预设正常。携带真实会话的 69 个工具，在千问思考模式、千问普通模式和 GLM Chat 通道均获得正常回复；另已验证函数调用及独立 `role: tool` 结果回传。多次热加载后，provider 保持单份注册，图片与视频工具各一份。未实际执行媒体生成。
+当前修复的验证结果：47 项离线回归测试全部通过（含真实 SSE 服务器上的超时/取消端到端用例）；本机 DSH 桌面配置可完整加载，四个 agent 预设正常。携带真实会话的 69 个工具，在千问思考模式、千问普通模式和 GLM Chat 通道均获得正常回复；另已验证函数调用及独立 `role: tool` 结果回传。多次热加载后，provider 保持单份注册，图片与视频工具各一份。未实际执行媒体生成。
