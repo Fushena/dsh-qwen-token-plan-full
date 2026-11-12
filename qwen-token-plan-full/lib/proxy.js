@@ -1,3 +1,4 @@
+import os from "node:os";
 import path from "node:path";
 import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
@@ -86,9 +87,11 @@ function loadUndici() {
   // **绝不要**把「当前工作目录」放进候选：cwd 由启动方式决定（用户可能从任意目录
   // 启动 DSH），从中解析 `undici` 等于允许那个目录里的第三方包在本宿主进程里执行任意
   // 代码 —— 一个打错的启动目录就能变成 RCE（2026-11-10 安全审计）。
+  // 兜底路径用 os.homedir()（跨平台，Windows 上 HOME 环境变量为空）；
+  // 自定义 profile 名的用户由 DSH_PROFILE_DIR 候选命中，desktop 兜底只服务默认 profile。
   const candidates = [
     process.env.DSH_PROFILE_DIR,
-    path.join(process.env.DSH_HOME || path.join(process.env.HOME || "", ".dsh"), "profiles", "desktop"),
+    path.join(process.env.DSH_HOME || path.join(os.homedir(), ".dsh"), "profiles", "desktop"),
   ].filter((dir) => typeof dir === "string" && dir.trim() !== "");
   for (const root of candidates) {
     try {

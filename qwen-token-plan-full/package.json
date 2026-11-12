@@ -1,6 +1,6 @@
 {
   "name": "dsh-qwen-token-plan-full",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "description": "Qwen Token Plan 全能路由：动态模型目录 + Responses/Chat 双协议 + 服务端内置工具（等级自动上限） + 图片/视频生成权益",
   "type": "module",
   "main": "index.js",
@@ -18,7 +18,8 @@
     "locale/*.json",
     "icon.svg",
     "cordis.patch.yml",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "dsh": {
     "bundle": {
@@ -33,11 +34,12 @@
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.1 || ^4.0.2 || ^4.1.0",
-    "@deepseek-ai/dsh-llm": "^0.2.1-rc.5",
-    "@deepseek-ai/dsh-credentials": "^0.2.1-rc.5",
+    "@deepseek-ai/dsh-llm": "^0.2.1-rc.5 || ^0.2.2-rc.1",
+    "@deepseek-ai/dsh-credentials": "^0.2.1-rc.5 || ^0.2.2-rc.1",
     "@deepseek-ai/schemastery": "~3.18.5 || ~3.19.0"
   },
   "scripts": {
     "test": "node test/run.mjs"
-  }
+  },
+  "license": "MIT"
 }
