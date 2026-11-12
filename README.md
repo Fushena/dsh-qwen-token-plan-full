@@ -2,6 +2,38 @@
 
 按你的 Token Plan（个人版）实际权益重写的 DSH Host 插件，是 `dsh-qwen-token-plan-cn-responses` 的全功能替代品：
 
+## 如何安装 / Installation
+
+三种方式任选其一，装完 bundle 默认启用。发布标签见 <https://github.com/Fushena/dsh-qwen-token-plan-full/tags>。
+
+**A. 插件页（推荐，Desktop 与 Web 通用）**
+打开侧边栏 **Plugins** 页或 **Settings → Plugins**，在安装对话框粘贴 git 地址：
+
+```
+github:Fushena/dsh-qwen-token-plan-full
+```
+
+追加标签可锁定版本，如 `github:Fushena/dsh-qwen-token-plan-full#v0.3.4`。宿主会拉取仓库、装入当前 profile 并启用 bundle；开启 HMR 时刷新页面即生效，否则按宿主提示重启。
+
+**B. 命令行**
+
+```sh
+dsh plugin --profile <profile> add github:Fushena/dsh-qwen-token-plan-full
+```
+
+`<profile>` 换成宿主实际运行的 profile —— Desktop 一般为 `desktop`（会话内 `echo $DSH_PROFILE` 可见）。装错 profile（比如 Desktop 却装进 `web`）会导致插件在你的应用里不可见。
+
+**C. clone 后安装（开发 / 离线）**
+
+```sh
+git clone https://github.com/Fushena/dsh-qwen-token-plan-full.git
+dsh plugin --profile <profile> add link:/绝对路径/dsh-qwen-token-plan-full
+```
+
+或让 DSH agent 调用 `plugin_manager` → `install_bundle`，`target` 填 clone 目录的绝对路径。
+
+**装完之后**：在 Settings → Models 配置凭据引用 `QWEN_TOKEN_PLAN_CN_API_KEY`（见下文前置条件），再在模型选择器里选本 provider。更新：重装更新的标签，或重跑同一条 `add` 命令。
+
 ## 前置条件与平台支持 / Prerequisites
 
 - **DSH 版本**：针对 DeepSeek Harness **0.2.2-rc.1** 开发与验证；peer 依赖
