@@ -109,3 +109,51 @@ test('空闲超时：慢但持续的流不会被掐断，卡死会及时 TIMEOUT
     });
   });
 });
+
+test('空闲超时：内置工具执行中（searching 等事件持续到达、无文本增量）不得被 TIMEOUT 误杀', async () => {
+  // 回归（2026-11-13 lead 探针实锤）：web_search_call 在服务端执行期间，SSE 只发
+  // response.web_search_call.searching 这类「进行中」事件；解析器 default:break 不产出
+  // chunk → adapter 的空闲 deadline 不被 touch → 健康请求在 requestTimeoutMs 处被掐断。
+  // 这里 5 个 searching 事件每 150ms 一个（750ms，远超 400ms 阈值），随后正常收尾。
+  const recorded = [];
+  const budget = {
+    filterTools: (tools) => ({ tools, dropped: [] }),
+    noteSuppression() {},
+    status: () => ({ usage: { periodAnchor: null } }),
+    record: (type) => { recorded.push(type); },
+  };
+  await withServer((req, res) => {
+    res.writeHead(200, SSE);
+    send(res, { type: 'response.output_item.added', output_index: 0, item: { type: 'web_search_call', status: 'in_progress' } });
+    let i = 0;
+    const timer = setInterval(() => {
+      i += 1;
+      if (i <= 5) {
+        send(res, { type: 'response.web_search_call.searching', output_index: 0 });
+        return;
+      }
+      clearInterval(timer);
+      send(res, { type: 'response.output_item.done', output_index: 0, item: { type: 'web_search_call', status: 'completed' } });
+      send(res, { type: 'response.completed', response: { usage: { input_tokens: 1, output_tokens: 1 } } });
+      res.end();
+    }, 150);
+  }, async (port) => {
+    const adapter = new QwenTokenPlanAdapter({
+      ctx, catalog, providerId: 'qwen-token-plan-full', displayName: 'Qwen', apiKeyEnv: 'T',
+      endpoint: `http://127.0.0.1:${port}/responses`,
+      chatEndpoint: `http://127.0.0.1:${port}/chat`,
+      harnessMode: { mode: 'auto' }, pluginName: 'test', budget,
+      requestTimeoutMs: 400, fetchImpl: globalThis.fetch,
+    });
+    const chunks = [];
+    for await (const chunk of adapter.stream({ model: model.id, messages: [], signal: new AbortController().signal })) {
+      chunks.push(chunk);
+    }
+    // 续命信号不得泄漏成内容块；工具活动文本与正常收尾照旧。
+    assert.equal(chunks.some((c) => c.type === 'heartbeat'), false, 'heartbeat 是内部续命信号，不得转发给上层');
+    const text = chunks.filter((c) => c.type === 'text-delta').map((c) => c.text).join('');
+    assert.match(text, /联网搜索/, '工具活动文本必须照常产出');
+    assert.deepEqual(chunks.at(-1), { type: 'finish', reason: { kind: 'stop' } });
+    assert.deepEqual(recorded, ['web_search_call'], '同一工具项只计一次权益');
+  });
+});

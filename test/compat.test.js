@@ -14,7 +14,7 @@ import { QwenTokenPlanAdapter } from '../lib/adapter.js';
 import { registerMediaTools } from '../lib/media-tools.js';
 import { normalizeHarnessMode } from '../lib/harness.js';
 import { HarnessBudget } from '../lib/budget.js';
-import { BUILTIN_CATALOG } from '../lib/catalog.js';
+import { BUILTIN_CATALOG, DynamicCatalog } from '../lib/catalog.js';
 const qwen = BUILTIN_CATALOG.models.find(m => m.id === 'qwen3.8-flash');
 const glm = BUILTIN_CATALOG.models.find(m => m.transport === 'chat');
 const tool = { name: 'web_search', description: 'Search', parameters: { type: 'object', properties: {} } };
@@ -303,6 +303,31 @@ test('image tool rejects n above remaining image entitlement before charging',as
   } finally { rmSync(dir,{recursive:true,force:true}); }
 });
 
+test('image tool counts each downloaded image even when a later download fails', async () => {
+  // 回归（2026-11-13）：旧实现全部下载成功才 record(paths.length)，中途失败/abort
+  // → 已落盘的那几张全漏计 → 本地额度高估。每张成功即计 1，失败时已成功的仍计入。
+  const dir=mkdtempSync(path.join(os.tmpdir(),'qtpf-img-partial-'));
+  try {
+    const definitions=[];const recorded=[];
+    const credentials={resolve:async()=>({value:'fixture'})};
+    const workingDirectory={ensure:async()=>dir};
+    const ctx={get:name=>name==='credentials'?credentials:workingDirectory,tools:{register:def=>{definitions.push(def);return ()=>{};}}};
+    const budget={equityState:()=>({key:'image_generation',used:0,quota:20,remaining:20,unit:'张',source:'local'}),
+      record:(key,count)=>{recorded.push([key,count]);return null;}};
+    const dispose=registerMediaTools(ctx,{apiKeyEnv:'TEST',pluginName:'test',origin:'https://example.invalid',chatEndpoint:'https://example.invalid/chat',imageModels:['image'],videoModels:['video'],defaultImageModel:'image',defaultVideoModel:'video',budget,fetchImpl:async(url)=>{
+      if(String(url).endsWith('/chat'))return Response.json({choices:[{message:{content:[{type:'image',image:'https://example.invalid/a.png'},{type:'image',image:'https://example.invalid/b.png'}]}}]});
+      if(String(url).endsWith('/b.png'))throw new Error('download boom');
+      return new Response('x',{headers:{'content-type':'image/png'}});
+    }});
+    const imageTool=definitions[0];
+    const exec={agent:{},signal:new AbortController().signal};
+    await assert.rejects(imageTool.execute({prompt:'p',n:2},exec),/download boom/);
+    assert.deepEqual(recorded,[['image_generation',1]],'第一张已落盘：失败也必须计入（旧实现 record=[]）');
+    assert.equal(readdirSync(dir).filter(f=>f.startsWith('qwen-image')).length,1,'第一张确实已落盘');
+    dispose();
+  } finally { rmSync(dir,{recursive:true,force:true}); }
+});
+
 test('media tools propagate DSH directory errors instead of writing elsewhere',async()=>{
   const definitions=[];let requests=0;
   const credentials={resolve:async()=>({value:'fixture'})};
@@ -404,4 +429,58 @@ test('stale or missing console data falls back to the local estimate',async()=>{
   assert.equal(reloaded.equityState('search_pro').source,'local');
   assert.equal(reloaded.status().equitiesFresh,false);
   assert.equal(reloaded.equityState('search_pro').remaining,100);
+});
+
+test('period rollover clears the official equities snapshot (new period falls back to local, not stale available=0)', async () => {
+  // 回归（2026-11-13）：#rollover/setTier 过期分支只清 byEquity+suppressedNotifiedAt，
+  // 不清 equities/equitiesFetchedAt/equityUsedAtFetch → 新周期 15min 新鲜期内仍用
+  // 旧周期 available=0 → 工具被误抑制。重置后必须回落 local 兜底（新周期满额）。
+  const dir=mkdtempSync(path.join(os.tmpdir(),'qtpf-rollover-'));
+  const file=path.join(dir,'budget.json');
+  const tierInfo={specCode:'standard',quota:{},usage:{per1MonthPercentage:0.5,per1MonthResetTime:Date.now()+86400000},subscription:{},fetchedAt:Date.now()};
+  try {
+    // 路径 A：#rollover —— 落盘状态锚点已过期，官网快照 available=0 且仍新鲜。
+    writeFileSync(file,JSON.stringify({
+      periodAnchor:Date.now()-1000,
+      tier:{specCode:'standard',resetTime:Date.now()+86400000,source:'gateway'},
+      byEquity:{search_pro:5},
+      equities:[{key:'search_pro',unit:'次',available:0,total:100}],
+      equitiesFetchedAt:Date.now(),
+      equityUsedAtFetch:{},
+    }));
+    const a=new HarnessBudget({config:{},filePath:file});
+    const stateA=a.equityState('search_pro');
+    assert.equal(stateA.source,'local','新周期不得沿用旧周期官网快照（旧实现 official/0）');
+    assert.equal(stateA.remaining,100,'新周期本地计数已清零 → 满额');
+    assert.equal(a.status().equitiesFresh,false,'重置后官网快照视为不新鲜');
+
+    // 路径 B：setTier 过期分支 —— 正常周期内官网 available=0，随后锚点过期再 setTier。
+    const b=new HarnessBudget({config:{},filePath:file});
+    b.setTier(tierInfo);
+    b.setEquities([{key:'search_pro',unit:'次',available:0,total:100}]);
+    assert.equal(b.equityState('search_pro').source,'official');
+    const raw=JSON.parse(readFileSync(file,'utf8'));
+    raw.periodAnchor=Date.now()-1000;
+    writeFileSync(file,JSON.stringify(raw));
+    const c=new HarnessBudget({config:{},filePath:file});
+    c.setTier(tierInfo); // 旧锚点过期 → 应连同官网快照一起清
+    const stateC=c.equityState('search_pro');
+    assert.equal(stateC.source,'local','setTier 周期结算必须同时清官网快照（旧实现 official/0）');
+    assert.equal(stateC.remaining,100);
+  } finally { rmSync(dir,{recursive:true,force:true}); }
+});
+
+test('live catalog excludes wanx image models (wanx2.1 must not leak into chat catalog)', async () => {
+  // 回归（2026-11-13）：NON_CHAT_PATTERNS 的 /^wan\d/ 不匹配 wanx2.1（x 不是数字）
+  // → 图像模型混入对话目录，选中后 chat 失败。wanx 系列必须被排除。
+  const ctx={get:()=>({resolve:async()=>({value:'K'})})};
+  const catalog=new DynamicCatalog({
+    ctx, modelsUrl:'https://example.invalid/compatible-mode/v1/models',
+    apiKeyEnv:'TEST', pluginName:'test',
+    fetchImpl:async()=>Response.json({data:[{id:'wanx2.1-t2i-turbo'},{id:'qwen3.8-flash'}]}),
+  });
+  assert.equal(await catalog.refresh(),true,'注入式刷新应成功');
+  const ids=catalog.snapshot().models.map(m=>m.id);
+  assert.equal(ids.includes('wanx2.1-t2i-turbo'),false,'wanx 图像模型不得进入对话目录（旧实现混入）');
+  assert.equal(ids.includes('qwen3.8-flash'),true,'正常对话模型保留');
 });

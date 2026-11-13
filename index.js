@@ -125,6 +125,9 @@ export function apply(ctx, config = {}) {
   };
   let tierRefreshing = null;
   let tierRetryTimer = null;
+  // 「60 秒后自动重试一次」必须名副其实：重试再失败不再排下一次，
+  // 否则断网时每分钟 fetch+setTierFallback→budget#save 无限写盘（2026-11-13 修复）。
+  let tierRetried = false;
   const refreshTier = () => {
     if (tierRefreshing) return tierRefreshing;
     tierRefreshing = (async () => {
@@ -148,8 +151,10 @@ export function apply(ctx, config = {}) {
         // Cookie 过期/失效签名 → 自动开登录会话（冷却期内不重复弹页）。
         relogin.maybeAuto(reason).catch(() => {});
         // 启动/热重载瞬间宿主网络偶发未就绪（实测一次 "fetch failed"，重试即恢复）：
-        // 60 秒后自动重试一次，避免带着兜底等级等满整个刷新周期。
-        if (tierRetryTimer === null) {
+        // 60 秒后自动重试一次，避免带着兜底等级等满整个刷新周期。只重试一次：
+        // 再失败交给周期刷新（tierRefreshHours）兜底，不无限排 60s。
+        if (!tierRetried) {
+          tierRetried = true;
           const retry = () => { tierRetryTimer = null; if (!stopped) refreshTier().catch(() => {}); };
           tierRetryTimer = typeof ctx.timeout === "function" ? ctx.timeout(retry, 60_000) : setTimeout(retry, 60_000);
         }

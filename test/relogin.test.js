@@ -148,6 +148,36 @@ test('failed auto session blocks further auto pops for the rest of the day', asy
   assert.equal(calls.open, 2, '次日恢复自动能力');
 });
 
+test('manual reuse of a running auto session must not wash away the auto flag (daily block survives)', async () => {
+  // 回归（2026-11-13）：start() 在幂等复用 return 之前无条件 `#sessionAuto = auto===true`，
+  // 自动会话进行中用户点手动「一键登录」（start({auto:false})）→ 标记被洗成 false →
+  // 该会话失败后当日熔断失效，同日仍自动弹页，违反弹窗纪律。
+  const { bridge, calls } = fakeBridge();
+  const { clock, ctx } = harness();
+  const flow = new ReloginFlow({ ctx, cookieEnv: 'X_COOKIE', bridge, now: () => clock.now });
+  const first = await flow.start({ auto: true });
+  assert.equal(first.ok, true);
+  assert.equal(calls.open, 1);
+  // 手动入口幂等复用进行中的自动会话：不再开页，也不得改写会话的自动属性。
+  const reuse = await flow.start({ auto: false });
+  assert.equal(reuse.ok, true);
+  assert.equal(reuse.already, true);
+  assert.equal(calls.open, 1, '复用不重复开页');
+  // 会话以失败收场：它仍是「自动发起的会话」→ 当日熔断必须生效。
+  flow.cancel('用户取消了登录');
+  clock.now += 30 * 60_000;
+  await flow.maybeAuto('未配置 X_COOKIE');
+  assert.equal(calls.open, 1, '自动会话失败后当日不再自动弹（手动复用不得洗掉标记）');
+
+  // 对照组：纯自动会话失败同样熔断（既有语义，修复不得破坏）。
+  const control = fakeBridge();
+  const flow2 = new ReloginFlow({ ctx, cookieEnv: 'X_COOKIE', bridge: control.bridge, now: () => clock.now });
+  await flow2.start({ auto: true });
+  flow2.cancel('模拟登录页被关闭');
+  await flow2.maybeAuto('未配置 X_COOKIE');
+  assert.equal(control.calls.open, 1, '对照：纯自动失败也当日熔断');
+});
+
 test('manual session failure does not trip the daily block', async () => {
   const { bridge, calls } = fakeBridge();
   const { clock, ctx } = harness();

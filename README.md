@@ -13,7 +13,7 @@
 github:Fushena/dsh-qwen-token-plan-full
 ```
 
-追加标签可锁定版本，如 `github:Fushena/dsh-qwen-token-plan-full#v0.3.5`。宿主会拉取仓库、装入当前 profile 并启用 bundle；开启 HMR 时刷新页面即生效，否则按宿主提示重启。
+追加标签可锁定版本，如 `github:Fushena/dsh-qwen-token-plan-full#v0.3.6`。宿主会拉取仓库、装入当前 profile 并启用 bundle；开启 HMR 时刷新页面即生效，否则按宿主提示重启。
 
 **B. 命令行**
 
@@ -160,7 +160,7 @@ Esc 也可关闭。数据同源口径：套餐剩余 = 网关 `per1MonthPercenta
 
 ### 本地验证
 
-在插件目录执行 `npm test`（51 项：compat + relogin + route-guard + proxy + media + stream + model-display）。
+在插件目录执行 `npm test`（61 项：compat + relogin + stream + tier-retry + route-guard + model-display，含媒体下载 SSRF/重定向回归）。
 
 **`test/stream.test.js` 必须用真实 HTTP 服务器而不是假流**：超时靠 abort 请求信号生效，真实 undici 收到 abort 会取消 body 并让读取抛错；手写假流不响应 abort，只能测出「定时器到点」，测不出「读取是否真的被中止」。它钉死三条语义：慢但持续的流必须完整读完（超时是**空闲超时**不是总时长，否则长回答会被掐断）、卡死的流要在阈值附近报 TIMEOUT、用户取消要立刻报 ABORTED。
 
@@ -168,4 +168,4 @@ Esc 也可关闭。数据同源口径：套餐剩余 = 网关 `per1MonthPercenta
 
 真实联网验证需单独进行；正常测试不会运行图片或视频生成。
 
-当前修复的验证结果：47 项离线回归测试全部通过（含真实 SSE 服务器上的超时/取消端到端用例）；本机 DSH 桌面配置可完整加载，四个 agent 预设正常。携带真实会话的 69 个工具，在千问思考模式、千问普通模式和 GLM Chat 通道均获得正常回复；另已验证函数调用及独立 `role: tool` 结果回传。多次热加载后，provider 保持单份注册，图片与视频工具各一份。未实际执行媒体生成。
+当前修复的验证结果（v0.3.6，2026-11-13 安全与稳定性审计）：61 项离线回归测试全部通过（含真实 SSE 服务器上的超时/取消端到端用例、内置工具进行中事件的续命回归、下载重定向逐跳校验的回环服务器用例）；本机 DSH 桌面配置可完整加载，四个 agent 预设正常。携带真实会话的 69 个工具，在千问思考模式、千问普通模式和 GLM Chat 通道均获得正常回复；另已验证函数调用及独立 `role: tool` 结果回传。多次热加载后，provider 保持单份注册，图片与视频工具各一份。未实际执行媒体生成。

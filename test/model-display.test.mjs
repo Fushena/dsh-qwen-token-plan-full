@@ -57,6 +57,25 @@ test('sortModels groups families and orders newest first inside each group', () 
   ]);
 });
 
+test('cross-year MMDD snapshots sort newest-first (0101 is newer than 1231)', () => {
+  // 百炼 MMDD 后缀不带年份：1231 是年末、0101 是次年年初，裸数值比较会把
+  // 次年 1 月排在去年 12 月之下。排序必须识别跨年（六位 YYMMDD 不受影响）。
+  const ids = (list) => list.map((m) => m.id);
+  assert.deepEqual(
+    ids(sortModels([{ id: 'qwen3.8-max-1231' }, { id: 'qwen3.8-max-0101' }])),
+    ['qwen3.8-max-0101', 'qwen3.8-max-1231'],
+  );
+  assert.deepEqual(
+    ids(sortModels([{ id: 'glm-5.3-1231' }, { id: 'glm-5.3-0101' }, { id: 'glm-5.3-1017' }])),
+    ['glm-5.3-0101', 'glm-5.3-1231', 'glm-5.3-1017'],
+  );
+  // 无日期别名仍视为最新，排在一切带日期快照之上
+  assert.deepEqual(
+    ids(sortModels([{ id: 'qwen3.8-max-1231' }, { id: 'qwen3.8-max' }, { id: 'qwen3.8-max-0101' }])),
+    ['qwen3.8-max', 'qwen3.8-max-0101', 'qwen3.8-max-1231'],
+  );
+});
+
 test('model-display.js is byte-identical to the ark-agent-plan copy (drift guard)', () => {
   const sibling = path.join(here, '../../../ark-agent-plan/lib/model-display.js');
   if (!fs.existsSync(sibling)) return; // 独立 clone 时无兄弟目录，跳过

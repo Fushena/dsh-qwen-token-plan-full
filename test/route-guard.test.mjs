@@ -1,10 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, mkdtempSync, rmSync } from 'node:fs';
+import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { trustedRouteRequest, isLoopbackHostname, hostnameOf } from '../lib/route-guard.js';
-import { download, assertDownloadUrl } from '../lib/media-tools.js';
+import { download, assertDownloadUrl, isPrivateHostLiteral } from '../lib/media-tools.js';
 
 // 这些用例复刻 2026-11-10 实测的攻击面：DSH 的 prefix 路由不做鉴权，
 // 旧守卫把 Origin 与 Host 自比 → DNS rebinding 直接 200。
@@ -53,6 +54,38 @@ test('route guard: browser cross-site signals are rejected', () => {
     trustedRouteRequest(req({ host: '127.0.0.1:49419', origin: 'null' }), BIND),
     false,
     '⑨ Origin: null（沙箱 iframe/本地文件）→ 拒绝',
+  );
+});
+
+test('route guard: same-site pages on OTHER local ports are rejected (Origin must match scheme+host+port)', () => {
+  // 回归（2026-11-13）：旧 c) 只比 Origin 的 hostname，丢协议与端口 →
+  // 本机 8080 端口的任意页面（浏览器标 sec-fetch-site: same-site）能对 49419 的
+  // /login 等副作用路由发 CSRF。Origin 必须与请求自身的完整 origin 一致。
+  assert.equal(
+    trustedRouteRequest(req({ host: '127.0.0.1:49419', origin: 'http://127.0.0.1:8080', 'sec-fetch-site': 'same-site' }), BIND),
+    false,
+    '同 hostname 不同端口 → 拒绝（现漏洞：trusted=true）',
+  );
+  assert.equal(
+    trustedRouteRequest(req({ host: 'localhost:49419', origin: 'http://127.0.0.1:49419', 'sec-fetch-site': 'same-site' }), BIND),
+    false,
+    'localhost 与 127.0.0.1 是不同 origin（same-site）→ 拒绝',
+  );
+  assert.equal(
+    trustedRouteRequest(req({ host: '127.0.0.1:49419', origin: 'https://127.0.0.1:49419' }), BIND),
+    false,
+    '协议不同（https vs 本机 http 服务）→ 拒绝',
+  );
+  // 合法同源必须仍放行：完整一致；默认端口写法归一化后一致。
+  assert.equal(
+    trustedRouteRequest(req({ host: '127.0.0.1:49419', origin: 'http://127.0.0.1:49419', 'sec-fetch-site': 'same-origin' }), BIND),
+    true,
+    '完整同源 → 放行',
+  );
+  assert.equal(
+    trustedRouteRequest(req({ host: '127.0.0.1:80', origin: 'http://127.0.0.1' }), BIND),
+    true,
+    '默认端口归一化（:80 与省略等价）→ 放行',
   );
 });
 
@@ -119,6 +152,71 @@ test('media download: non-https, private, and oversized results are refused', as
   assert.throws(() => assertDownloadUrl('http://127.0.0.1/x.png'), /非 https/);
   assert.equal(assertDownloadUrl('https://example.invalid/x.png').hostname, 'example.invalid');
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('media download: IPv6 private literals (mapped / ULA / link-local) are refused', async () => {
+  // 回归（2026-11-13 审计）：旧 isPrivateHostLiteral 只认 ::1/:: 与 IPv4 四段，
+  // IPv4-mapped IPv6、ULA fc00::/7、链路本地 fe80::/10 全部漏过。
+  // 注意 new URL 会把 ::ffff:127.0.0.1 规范化成 [::ffff:7f00:1]，两种写法都要拦。
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'qtpf-dl-'));
+  const okFetch = async () => new Response('x', { headers: { 'content-type': 'image/png' } });
+  try {
+    for (const host of [
+      '[::ffff:127.0.0.1]', '[::ffff:7f00:1]', '[0:0:0:0:0:ffff:7f00:1]',
+      '[::ffff:10.0.0.5]', '[::ffff:192.168.1.1]',
+      '[::127.0.0.1]', '[::7f00:1]',
+      '[fc00::1]', '[fd12:3456::1]', '[fe80::1]', '[fec0::1]',
+    ]) {
+      await assert.rejects(download(okFetch, `https://${host}/a.png`, dir, 'qwen-image', 'png'), /本机\/内网/, `应拒绝 ${host}`);
+    }
+    // 公网 IPv6 与 mapped 公网地址不得误伤。
+    assert.equal(isPrivateHostLiteral('2606:4700::1111'), false);
+    assert.equal(isPrivateHostLiteral('2001:4860:4860::8888'), false);
+    assert.equal(isPrivateHostLiteral('::ffff:8.8.8.8'), false);
+    const saved = await download(okFetch, 'https://[2606:4700::1111]/a.png', dir, 'qwen-image', 'png');
+    assert.equal(saved.bytes, 1);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('media download: redirects are re-validated hop by hop (302 to loopback is refused)', async () => {
+  // 回归（2026-11-13 审计）：旧 download 用默认 redirect:follow，上游 302 →
+  // http://127.0.0.1/… 时校验只在第一跳做过，内网响应体被直接读走。
+  // 这里用真实 fetch（undici 默认跟随重定向）+ 回环服务器模拟被投毒的上游：
+  // 公网 https 地址的应答实际来自本地服务器。全程只碰 127.0.0.1，不出网。
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'qtpf-dl-'));
+  const srv = http.createServer((req, res) => {
+    const port = srv.address().port;
+    if (req.url === '/a.png') { res.writeHead(302, { location: `http://127.0.0.1:${port}/internal` }); res.end(); return; }
+    if (req.url === '/b.png') { res.writeHead(302, { location: 'https://10.0.0.5/x.png' }); res.end(); return; }
+    if (req.url === '/loop.png') { res.writeHead(302, { location: 'https://cdn.example.invalid/loop.png' }); res.end(); return; }
+    if (req.url === '/ok.png') { res.writeHead(302, { location: 'https://cdn.example.invalid/final.png' }); res.end(); return; }
+    if (req.url === '/final.png') { res.writeHead(200, { 'content-type': 'image/png' }); res.end('IMG'); return; }
+    res.writeHead(200, { 'content-type': 'image/png' }); res.end('SECRET-INTERNAL');
+  });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  const port = srv.address().port;
+  const poisonedFetch = (url, opts) => fetch(`http://127.0.0.1:${port}${new URL(String(url)).pathname}`, opts);
+  try {
+    // 攻击用例在前：修复前第一条就会读到 SECRET-INTERNAL 而失败（不会走到后面的 DNS）。
+    await assert.rejects(
+      download(poisonedFetch, 'https://cdn.example.invalid/a.png', dir, 'qwen-image', 'png'),
+      /非 https|本机\/内网|重定向/,
+      '302 → http://127.0.0.1 必须拒绝，不得跟随后读走内网响应体',
+    );
+    await assert.rejects(
+      download(poisonedFetch, 'https://cdn.example.invalid/b.png', dir, 'qwen-image', 'png'),
+      /本机\/内网/,
+      '302 → https://10.0.0.5（内网 https）同样必须拒绝',
+    );
+    await assert.rejects(
+      download(poisonedFetch, 'https://cdn.example.invalid/loop.png', dir, 'qwen-image', 'png'),
+      /重定向/,
+      '无限重定向必须有跳数上限',
+    );
+    // 合法 https→https 公网重定向仍要能手动跟随下载。
+    const saved = await download(poisonedFetch, 'https://cdn.example.invalid/ok.png', dir, 'qwen-image', 'png');
+    assert.equal(saved.bytes, 3);
+  } finally { srv.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 
 test('index.js wires the guard in front of every route branch', () => {
