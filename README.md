@@ -160,7 +160,7 @@ Esc 也可关闭。数据同源口径：套餐剩余 = 网关 `per1MonthPercenta
 
 ### 本地验证
 
-在插件目录执行 `npm test`（47 项：compat + relogin + route-guard + proxy + media + stream）。
+在插件目录执行 `npm test`（51 项：compat + relogin + route-guard + proxy + media + stream + model-display）。
 
 **`test/stream.test.js` 必须用真实 HTTP 服务器而不是假流**：超时靠 abort 请求信号生效，真实 undici 收到 abort 会取消 body 并让读取抛错；手写假流不响应 abort，只能测出「定时器到点」，测不出「读取是否真的被中止」。它钉死三条语义：慢但持续的流必须完整读完（超时是**空闲超时**不是总时长，否则长回答会被掐断）、卡死的流要在阈值附近报 TIMEOUT、用户取消要立刻报 ABORTED。
 
