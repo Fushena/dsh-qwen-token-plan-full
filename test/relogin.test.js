@@ -17,7 +17,7 @@ test('cookie failure signatures match only cookie-class gateway errors', () => {
   assert.equal(isCookieFailure('AbortError: signal timeout'), false);
 });
 
-test('failure kinds: missing pops immediately, suspect needs streak confirmation', () => {
+test('failure kinds: missing pops immediately, suspect never auto-pops', () => {
   assert.equal(cookieFailureKind('未配置 BAILIAN_CONSOLE_COOKIE（~/.dsh/.env）'), 'missing');
   assert.equal(cookieFailureKind('缺少 BAILIAN_CONSOLE_COOKIE'), 'missing');
   assert.equal(cookieFailureKind('user/info.json 未返回 secToken（Cookie 可能已过期）'), 'suspect');
@@ -51,37 +51,30 @@ function harness({ startMs = 1_793_800_000_000 } = {}) {
   return { clock, ctx };
 }
 
-test('suspect failure pops only after 2 distinct refresh periods', async () => {
+test('suspect failures never auto-pop regardless of streak (2026-11-13 收紧)', async () => {
   const { bridge, calls } = fakeBridge();
   const { clock, ctx } = harness();
   const flow = new ReloginFlow({ ctx, cookieEnv: 'X_COOKIE', bridge, now: () => clock.now });
-  // 第 1 个周期：只计数，不弹。
-  await flow.maybeAuto('网关 usage HTTP 401');
-  assert.equal(calls.open, 0, '单次疑似失败绝不弹页');
-  // 同一周期内的重复失败（面板强刷撞车）：去重，仍不弹。
-  clock.now += 60_000;
-  await flow.maybeAuto('网关 usage HTTP 401');
-  assert.equal(calls.open, 0, '周期内重复失败不叠加计数');
-  // 第 2 个周期：确认失效，弹一次。
-  clock.now += 3_600_000;
-  await flow.maybeAuto('网关 usage HTTP 401');
-  assert.equal(calls.open, 1, '连续两个刷新周期确认后弹一次');
-  // 会话进行中：后续失败不再叠弹（幂等复用）。
-  clock.now += 3_600_000;
-  await flow.maybeAuto('网关 usage HTTP 401');
-  assert.equal(calls.open, 1, '已有会话时绝不二次弹页');
+  // Cookie 在但网关判无效（401/403/secToken/specCode）：上游瞬断与限流也长这样，
+  // 弹页解决不了它们 —— 跨任意多个刷新周期都只记日志，绝不弹。
+  for (let i = 0; i < 5; i += 1) {
+    await flow.maybeAuto('网关 usage HTTP 401');
+    clock.now += 3_600_000;
+  }
+  assert.equal(calls.open, 0, 'suspect 签名永不自动弹页');
+  // 会话进行中也不弹（幂等）。
+  await flow.start({ auto: false });
+  await flow.maybeAuto('user/info.json 未返回 secToken（Cookie 可能已过期）');
+  assert.equal(calls.open, 1, '手动入口不受 suspect 纪律限制（仅这一次是手动开的）');
 });
 
-test('noteSuccess clears the streak so isolated blips never pop', async () => {
+test('noteSuccess stays a no-op and never gates popping (2026-11-13 收紧)', async () => {
   const { bridge, calls } = fakeBridge();
   const { clock, ctx } = harness();
   const flow = new ReloginFlow({ ctx, cookieEnv: 'X_COOKIE', bridge, now: () => clock.now });
-  await flow.maybeAuto('网关 usage HTTP 401'); // count=1
-  clock.now += 3_600_000;
-  flow.noteSuccess(); // 这轮取数成功 → 清零
-  clock.now += 3_600_000;
-  await flow.maybeAuto('网关 usage HTTP 401'); // count=1（重新开始）
-  assert.equal(calls.open, 0, '偶发瞬断被成功打断，永远凑不齐连续两个周期');
+  flow.noteSuccess();
+  await flow.maybeAuto('网关 usage HTTP 403');
+  assert.equal(calls.open, 0, 'suspect 失败在 noteSuccess 之后也绝不弹');
 });
 
 test('missing cookie pops immediately on first sight', async () => {
