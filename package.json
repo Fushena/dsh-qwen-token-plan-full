@@ -1,6 +1,6 @@
 {
   "name": "dsh-qwen-token-plan-full",
-  "version": "0.3.4",
+  "version": "0.3.5",
   "description": "Qwen Token Plan 全能路由：动态模型目录 + Responses/Chat 双协议 + 服务端内置工具（等级自动上限） + 图片/视频生成权益",
   "type": "module",
   "main": "index.js",

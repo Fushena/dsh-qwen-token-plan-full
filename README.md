@@ -13,7 +13,7 @@
 github:Fushena/dsh-qwen-token-plan-full
 ```
 
-追加标签可锁定版本，如 `github:Fushena/dsh-qwen-token-plan-full#v0.3.4`。宿主会拉取仓库、装入当前 profile 并启用 bundle；开启 HMR 时刷新页面即生效，否则按宿主提示重启。
+追加标签可锁定版本，如 `github:Fushena/dsh-qwen-token-plan-full#v0.3.5`。宿主会拉取仓库、装入当前 profile 并启用 bundle；开启 HMR 时刷新页面即生效，否则按宿主提示重启。
 
 **B. 命令行**
 
