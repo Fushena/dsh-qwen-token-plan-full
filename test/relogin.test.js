@@ -257,3 +257,108 @@ test('tier refresh default is 1h and autoRelogin defaults on', () => {
   assert.equal(config.tierRefreshHours, 1);
   assert.equal(config.autoRelogin, true);
 });
+
+// ── 2026-11-16 回归：能收割到 Cookie 时绝不弹登录页 ──────────────────────────
+// 修前缺陷：start() 在桥可用时无条件 open(DASHBOARD_URL)（还 activate 抢焦点），
+// 从不先 findConsoleTab()+harvestCookie() 试收割已登录的现有标签 → Chrome 明明
+// 已登录、Cookie 可收割，仍弹一个新登录页。收割只发生在开页之后的 #tick 里。
+
+/** 已登录假桥：findConsoleTab 命中用户自己的控制台标签，harvestCookie 能拿到票据。 */
+function loggedInBridge({ cookie = 'cna=x; login_qianwenai_ticket=tk', tabId = 77 } = {}) {
+  const calls = { open: 0, close: 0, find: 0, harvest: 0, activateless: 0 };
+  return {
+    calls,
+    bridge: {
+      available: () => true,
+      open: async () => { calls.open += 1; return 42; },
+      close: async () => { calls.close += 1; },
+      hasTab: async () => true,
+      findConsoleTab: async () => { calls.find += 1; return tabId; },
+      harvestCookie: async (id) => { calls.harvest += 1; return Number(id) === tabId ? cookie : null; },
+      launch: async () => true,
+    },
+  };
+}
+
+function tempHome() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'qtpf-silent-'));
+  fs.mkdirSync(path.join(home, '.dsh'), { recursive: true }); // updateEnvFile 不建目录，与生产一致（DSH home 已存在）
+  const prev = process.env.HOME;
+  process.env.HOME = home;
+  return { home, restore: () => { if (prev === undefined) delete process.env.HOME; else process.env.HOME = prev; fs.rmSync(home, { recursive: true, force: true }); } };
+}
+
+test('missing cookie + Chrome already logged in: auto path silently harvests, never opens a login page', async () => {
+  const { home, restore } = tempHome();
+  try {
+    const { bridge, calls } = loggedInBridge();
+    let refreshed = 0;
+    const stored = [];
+    const ctx = { timeout: () => () => {}, credentials: { set: async (ref, value) => { stored.push([ref, value]); } } };
+    const flow = new ReloginFlow({ ctx, cookieEnv: 'X_COOKIE', bridge, now: () => Date.now(), onSuccess: async () => { refreshed += 1; } });
+    await flow.maybeAuto('未配置 X_COOKIE');
+    assert.equal(calls.open, 0, 'Chrome 已登录且可收割：绝不弹登录页（修前这里会 open 一次）');
+    assert.ok(calls.find >= 1 && calls.harvest >= 1, '必须先尝试从现有标签收割');
+    assert.equal(flow.state().state, 'success', '静默收割应直接成功收尾');
+    assert.equal(refreshed, 1, '收割成功要触发 onSuccess 重取');
+    assert.match(fs.readFileSync(path.join(home, '.dsh', '.env'), 'utf8'), /^X_COOKIE=cna=x; login_qianwenai_ticket=tk$/m);
+    assert.deepEqual(stored, [['X_COOKIE', 'cna=x; login_qianwenai_ticket=tk']]);
+    assert.equal(calls.close, 0, '用户自己的标签不关');
+  } finally { restore(); }
+});
+
+test('manual one-click login also harvests silently when Chrome is already logged in', async () => {
+  const { home, restore } = tempHome();
+  try {
+    const { bridge, calls } = loggedInBridge();
+    const ctx = { timeout: () => () => {}, credentials: { set: async () => {} } };
+    const flow = new ReloginFlow({ ctx, cookieEnv: 'X_COOKIE', bridge, now: () => Date.now() });
+    const r = await flow.start({ auto: false });
+    assert.equal(r.ok, true);
+    assert.equal(calls.open, 0, '手动入口同样先收割：能拿到 Cookie 就不弹页');
+    assert.equal(flow.state().state, 'success');
+    assert.match(fs.readFileSync(path.join(home, '.dsh', '.env'), 'utf8'), /^X_COOKIE=/m);
+  } finally { restore(); }
+});
+
+test('same stale cookie harvested twice: second manual start falls through to the login page (recovery stays reachable)', async () => {
+  const { home, restore } = tempHome();
+  try {
+    const { bridge, calls } = loggedInBridge();
+    const ctx = { timeout: () => () => {}, credentials: { set: async () => {} } };
+    const flow = new ReloginFlow({ ctx, cookieEnv: 'X_COOKIE', bridge, now: () => Date.now() });
+    const first = await flow.start({ auto: false });
+    assert.equal(first.ok, true);
+    assert.equal(calls.open, 0, '第一次：静默收割');
+    // Cookie 已落盘但上游仍判失效（用户再次点「一键登录」）：同一份 Cookie 再收割
+    // 一次没有意义 —— 必须放行到登录页，否则用户永远到不了重新登录的入口。
+    const second = await flow.start({ auto: false });
+    assert.equal(second.ok, true);
+    assert.equal(calls.open, 1, '同一份 Cookie 第二次手动请求：开登录页让用户重新登录');
+    assert.equal(flow.state().state, 'waiting');
+  } finally { restore(); }
+});
+
+test('no logged-in tab: login page still opens (silent harvest must not swallow the only recovery path)', async () => {
+  const { home, restore } = tempHome();
+  try {
+    const { bridge, calls } = loggedInBridge();
+    bridge.findConsoleTab = async () => null; // Chrome 里没有任何控制台标签
+    const ctx = { timeout: () => () => {} };
+    const flow = new ReloginFlow({ ctx, cookieEnv: 'X_COOKIE', bridge, now: () => Date.now() });
+    await flow.maybeAuto('未配置 X_COOKIE');
+    assert.equal(calls.open, 1, '无可收割标签时登录页仍是唯一恢复路径');
+    assert.equal(flow.state().state, 'waiting');
+  } finally { restore(); }
+});
+
+test('logged-in tab present but harvest yields no ticket: login page opens', async () => {
+  const { home, restore } = tempHome();
+  try {
+    const { bridge, calls } = loggedInBridge({ cookie: null });
+    const ctx = { timeout: () => () => {} };
+    const flow = new ReloginFlow({ ctx, cookieEnv: 'X_COOKIE', bridge, now: () => Date.now() });
+    await flow.maybeAuto('未配置 X_COOKIE');
+    assert.equal(calls.open, 1, '标签在但未登录（收割不到票据）：照常开登录页');
+  } finally { restore(); }
+});
