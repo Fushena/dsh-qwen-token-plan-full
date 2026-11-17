@@ -47,11 +47,16 @@ test('tier fallback retry is one-shot: repeated failures never reschedule the 60
   globalThis.fetch = async () => { fetchCalls += 1; throw new TypeError('fetch failed'); };
   const { ctx, timeouts, cleanups } = fakeCtx();
   try {
-    apply(ctx, { mediaTools: false, proxy: 'none', autoRelogin: false });
+    // 显式指定 endpoint：本例只管兜底重试的排程次数，站点探测会多打两次 /models，
+    // 把计数搅浑。endpoint="auto" 的探测行为由 config-knobs.test.js 单独钉死。
+    apply(ctx, {
+      mediaTools: false, proxy: 'none', autoRelogin: false,
+      endpoint: 'https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/responses',
+    });
     await flush();
     const retrySchedules = () => timeouts.filter((entry) => entry.ms === 60_000);
     assert.equal(retrySchedules().length, 1, '首次失败应排且只排一个 60s 兜底重试');
-    assert.equal(fetchCalls, 3, '启动即取 catalog/tier/equity 各一次');
+    assert.equal(fetchCalls, 3, '启动即取 catalog/tier/equity 各一次（显式 endpoint 不做站点探测）');
 
     // 推进第一个 60s：重试仍失败（fetch 恒 reject）。一次性语义 → 不得再排。
     retrySchedules()[0].fn();

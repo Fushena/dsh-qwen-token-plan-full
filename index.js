@@ -1,4 +1,5 @@
 import z from "@deepseek-ai/schemastery";
+import { RetryPolicySchema } from "@deepseek-ai/dsh-llm";
 import { DynamicCatalog } from "./lib/catalog.js";
 import { QwenTokenPlanAdapter } from "./lib/adapter.js";
 import { registerMediaTools } from "./lib/media-tools.js";
@@ -8,8 +9,9 @@ import { fetchTierInfo, fetchEquityInfo, readConsoleCookie } from "./lib/gateway
 import { ReloginFlow } from "./lib/relogin.js";
 import { createProxyFetch, redactProxyUrl } from "./lib/proxy.js";
 import { trustedRouteRequest } from "./lib/route-guard.js";
+import { SITE_ENDPOINTS, deriveRoute, isAutoEndpoint, detectSite } from "./lib/site.js";
 
-const DEFAULT_ENDPOINT = "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/responses";
+const DEFAULT_ENDPOINT = SITE_ENDPOINTS.cn;
 const DEFAULT_IMAGE_MODELS = ["qwen-image-3.0-pro", "wan2.7-image", "wan2.7-image-pro"];
 const DEFAULT_VIDEO_MODELS = ["wan3.0-video"];
 const ROUTE_PREFIX = "/qwen-token-plan-full";
@@ -22,7 +24,9 @@ export const Config = z.object({
   providerId: z.string().default("qwen-token-plan-full"),
   displayName: z.string().default("千问 Token Plan 全能版"),
   apiKeyEnv: z.string().role("credential-ref").default("QWEN_TOKEN_PLAN_CN_API_KEY"),
-  endpoint: z.string().default(DEFAULT_ENDPOINT),
+  // "auto"：启动时并发探测国内站/国际站的 /models，谁 200 用谁（key 与地域绑定，
+  // 跨地域一律 401，见 lib/site.js）。显式写死一个 URL 则完全跳过探测。
+  endpoint: z.string().default("auto"),
   chatEndpoint: z.string(),
   harness: z.any().default("auto"),
   mediaTools: z.boolean().default(true),
@@ -43,6 +47,18 @@ export const Config = z.object({
   // 出站代理：留空读 HTTPS_PROXY/HTTP_PROXY/ALL_PROXY 环境变量；"none"/"off"/"direct" 强制直连。
   // Node 默认不继承系统代理，需要时由这里显式指定（仅支持 http/https）。
   proxy: z.string().default(""),
+  // 空闲超时（不是总时长）：多久没有新字节算卡死。跨境静默窗口比国内长得多
+  // （中间 NAT / 机场节点的空闲回收更激进），60s 会把健康请求误杀，故默认 120s。
+  // 必须与 retryPolicy 成对调：最坏墙钟 = requestTimeoutMs × (1 + maxRetries)。
+  requestTimeoutMs: z.number().min(1_000).default(120_000),
+  // 请求重试策略（DSH 的 llm-retry 在 provider 配置下读取，见 dsh-llm 的 RetryPolicySchema）。
+  // 跨境每次重试都要重新全量上传整段历史，DSH 默认的 5 次会把一次抖动放大成分钟级假死，
+  // 所以这里默认降到 2 次、退避起点抬到 1000ms。
+  retryPolicy: RetryPolicySchema.default({
+    mode: "normal",
+    maxRetries: 2,
+    backoff: { initialDelayMs: 1_000, maxDelayMs: 10_000, jitterRatio: 0.1 },
+  }),
 });
 
 /** tierRefreshHours 宿主侧兜底缺省值，与 Config 默认保持一致。 */
@@ -69,11 +85,21 @@ export function apply(ctx, config = {}) {
   const providerId = String(config.providerId || "qwen-token-plan-full");
   const displayName = String(config.displayName || "千问 Token Plan 全能版");
   const apiKeyEnv = String(config.apiKeyEnv || "QWEN_TOKEN_PLAN_CN_API_KEY");
-  const endpoint = String(config.endpoint || DEFAULT_ENDPOINT);
-  const chatEndpoint = String(config.chatEndpoint || endpoint.replace(/\/responses\/?$/, "/chat/completions"));
   const harnessMode = normalizeHarnessMode(config.harness);
-  const origin = new URL(endpoint).origin;
-  const modelsUrl = endpoint.replace(/\/responses\/?$/, "/models");
+
+  // —— 端点：auto 先按国内站装配，启动探测出结果后整套 URL 一起换（见下方 effect）。——
+  // route 是唯一的 URL 来源：adapter / catalog / media tools 都从它取值，
+  // 避免「只改了对话端点，图片视频还打旧地域」这种半切换。
+  const autoEndpoint = isAutoEndpoint(config.endpoint);
+  const explicitChat = typeof config.chatEndpoint === "string" && config.chatEndpoint.trim() !== ""
+    ? config.chatEndpoint.trim() : "";
+  // 必须是**同一个对象**：media tools 注册时捕获了它的引用，探测出结果后只能就地改属性，
+  // 换成新对象会让已注册的图片/视频工具永远拿着旧地域（2026-11-17）。
+  const route = deriveRoute(autoEndpoint ? DEFAULT_ENDPOINT : String(config.endpoint).trim());
+  if (explicitChat) route.chatEndpoint = explicitChat;
+  let siteState = autoEndpoint
+    ? { site: "auto", reason: "站点探测中" }
+    : { site: "manual", reason: "用户显式指定 endpoint" };
 
   const overrides = Array.isArray(config.models) ? config.models : [];
   const excludes = Array.isArray(config.excludeModels) ? config.excludeModels.map(String) : [];
@@ -91,7 +117,7 @@ export function apply(ctx, config = {}) {
   if (proxyLabel) ctx.logger?.info?.(`${name}: 出站请求经代理 ${proxyLabel}`);
 
   const catalog = new DynamicCatalog({
-    ctx, modelsUrl, apiKeyEnv, pluginName: name, overrides, excludes, logger: ctx.logger,
+    ctx, modelsUrl: route.modelsUrl, apiKeyEnv, pluginName: name, overrides, excludes, logger: ctx.logger,
     fetchImpl: proxyFetch,
   });
 
@@ -99,8 +125,12 @@ export function apply(ctx, config = {}) {
   const budget = new HarnessBudget({ config, logger: ctx.logger });
 
   const adapter = new QwenTokenPlanAdapter({
-    ctx, catalog, providerId, displayName, apiKeyEnv, endpoint, chatEndpoint, harnessMode,
+    ctx, catalog, providerId, displayName, apiKeyEnv,
+    endpoint: route.endpoint, chatEndpoint: route.chatEndpoint, harnessMode,
     pluginName: name, budget, fetchImpl: proxyFetch,
+    // 两个跨境旋钮必须真的传下去：不传就是恒 60s + 宿主默认 5 次重试（2026-11-17 修复）。
+    requestTimeoutMs: config.requestTimeoutMs,
+    retryPolicy: config.retryPolicy,
   });
 
   ctx.llm.registerConfigurableProviders([{
@@ -218,6 +248,11 @@ export function apply(ctx, config = {}) {
         models: snapshot.models.length,
         catalogSource: snapshot.source,
         catalogSyncedAt: snapshot.syncedAt ?? null,
+        // 面板要能看出「这把 key 到底落在哪个站点」，否则跨境 401 时无从排查。
+        endpoint: route.endpoint,
+        site: siteState.site,
+        siteReason: siteState.reason,
+        requestTimeoutMs: adapter.requestTimeoutMs,
       },
     };
   };
@@ -231,6 +266,44 @@ export function apply(ctx, config = {}) {
     };
   }, "qwen-token-plan-full: adapter");
 
+  // 站点自动判定：启动时并发探测国内站/国际站，命中后把整套 URL 一起换。
+  // 判定不出来（无 key / 两站点都不通 / 断网）时保留国内站默认值，插件照常可用。
+  const detectOnce = async () => {
+    try {
+      const result = await detectSite({
+        ctx, apiKeyEnv, pluginName: name, fetchImpl: proxyFetch,
+        signal: lifetime.signal, logger: ctx.logger,
+      });
+      if (stopped) return;
+      siteState = { site: result.site, reason: result.reason };
+      if (result.endpoint === route.endpoint) return;
+      // 就地改：media tools 捕获的是这个对象本身，换新对象它们就看不见。
+      Object.assign(route, deriveRoute(result.endpoint), explicitChat ? { chatEndpoint: explicitChat } : {});
+      adapter.retarget({ endpoint: route.endpoint, chatEndpoint: route.chatEndpoint });
+      catalog.retarget(route.modelsUrl);
+      ctx.logger?.info?.(`${name}: Token Plan 站点判定为 ${result.site}（${result.reason}），端点已切到 ${route.endpoint}`);
+      ctx.llm.emitAdaptersUpdated();
+    } catch (error) {
+      if (stopped) return;
+      siteState = { site: "cn", reason: `判定异常：${error instanceof Error ? error.message : String(error)}` };
+      ctx.logger?.warn?.(`${name}: 站点自动判定异常，保留国内站端点（${siteState.reason}）`);
+    }
+  };
+  // 只探一次；后到的调用者等同一个结果，不重复打上游。
+  let siteTask = null;
+  const resolveSite = () => { siteTask ??= detectOnce(); return siteTask; };
+
+  // 判定必须挡在**第一个模型请求之前**：国际站 key 在国内站一律 401，而 401 不在
+  // 可重试码里（DEFAULT_RETRYABLE_CODES），漏一轮就是整轮直接失败、llm-retry 也不救。
+  // 只在 auto 且还没判完时等，正常路径零额外开销；探测失败也放行（绝不因为探测卡住而拒绝服务）。
+  if (autoEndpoint) {
+    const originalStream = adapter.stream.bind(adapter);
+    adapter.stream = async function* gatedStream(options) {
+      await resolveSite();
+      yield* originalStream(options);
+    };
+  }
+
   if (config.mediaTools !== false && typeof ctx.tools?.register === "function") {
     const imageModels = Array.isArray(config.imageModels) && config.imageModels.length
       ? config.imageModels.map(String) : DEFAULT_IMAGE_MODELS;
@@ -238,7 +311,7 @@ export function apply(ctx, config = {}) {
       ? config.videoModels.map(String) : DEFAULT_VIDEO_MODELS;
     ctx.effect(() => {
       const disposeTools = registerMediaTools(ctx, {
-        apiKeyEnv, pluginName: name, origin, chatEndpoint,
+        apiKeyEnv, pluginName: name, route,
         imageModels, videoModels,
         defaultImageModel: String(config.defaultImageModel || imageModels[0]),
         defaultVideoModel: String(config.defaultVideoModel || videoModels[0]),
@@ -294,7 +367,10 @@ export function apply(ctx, config = {}) {
   }, "qwen-token-plan-full: status route");
 
   ctx.effect(() => {
-    catalogTick();
+    // 先定站点再拉目录：否则第一次目录刷新会打到旧站点，白跑一趟还可能覆盖成错目录。
+    // 不 await 整个 effect：那会把三个定时器的注册也推迟到探测之后（cordis 异步 effect 语义）。
+    if (autoEndpoint) resolveSite().then(catalogTick).catch(() => {});
+    else catalogTick();
     tierTick();
     refreshEquities().catch(() => {});
     const catalogTimer = makeTimer(catalogTick, refreshMinutes * 60_000);
@@ -313,7 +389,8 @@ export function apply(ctx, config = {}) {
   }, "qwen-token-plan-full: timers");
 
   ctx.logger?.info?.(
-    `${name}: 已注册 provider "${providerId}"（Responses=${endpoint}；Chat=${chatEndpoint}；` +
+    `${name}: 已注册 provider "${providerId}"（Responses=${route.endpoint}；Chat=${route.chatEndpoint}；` +
+    `站点 ${autoEndpoint ? "自动判定中" : "手动指定"}；空闲超时 ${adapter.requestTimeoutMs}ms；` +
     `内置工具 ${harnessMode.mode}；权益预算 ${budget.enabled ? "开启（等级自动上限）" : "关闭"}；` +
     `媒体工具 ${config.mediaTools === false ? "关闭" : "开启"}；目录每 ${refreshMinutes} 分钟刷新；` +
     `套餐每 ${tierRefreshHours} 小时刷新；Cookie 失效${config.autoRelogin === false ? "不会" : "将"}自动开登录页收割）`,
