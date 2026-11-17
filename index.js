@@ -1,5 +1,6 @@
 import z from "@deepseek-ai/schemastery";
 import { DynamicCatalog } from "./lib/catalog.js";
+import { CatalogFeed } from "./lib/catalog-feed.js";
 import { QwenTokenPlanAdapter } from "./lib/adapter.js";
 import { registerMediaTools } from "./lib/media-tools.js";
 import { normalizeHarnessMode } from "./lib/harness.js";
@@ -43,6 +44,17 @@ export const Config = z.object({
   // 出站代理：留空读 HTTPS_PROXY/HTTP_PROXY/ALL_PROXY 环境变量；"none"/"off"/"direct" 强制直连。
   // Node 默认不继承系统代理，需要时由这里显式指定（仅支持 http/https）。
   proxy: z.string().default(""),
+  // false = 观察-only：不注册 adapter/provider（模型从选择器消失），面板/计数/媒体工具照常。
+  // 聊天走手工 provider 时改插件不再中断请求；需要服务端内置工具时保持 true 并手动选本插件模型。
+  registerProvider: z.boolean().default(true),
+  // 旁路观察名单：这些 provider 的模型调用也计入面板「本周期调用次数」（本插件 providerId 始终在内）。
+  watchedProviders: z.array(z.string()).default(["qwentokenplan"]),
+  // 目录补货：定期从普通线路（pi-ai 手工 provider）自己的域名抓 /models，
+  // 把新对话模型追加进它的 models 配置（只追加、真变化才写、免重启生效）。
+  catalogFeed: z.boolean().default(true),
+  feedProvider: z.string().default("qwentokenplan"),
+  // 补货时是否翻译推理档位（reasoningEfforts + compat.thinkingFormat）；false 只补 id/name/容量/模态。
+  feedReasoning: z.boolean().default(true),
 });
 
 /** tierRefreshHours 宿主侧兜底缺省值，与 Config 默认保持一致。 */
@@ -75,6 +87,12 @@ export function apply(ctx, config = {}) {
   const origin = new URL(endpoint).origin;
   const modelsUrl = endpoint.replace(/\/responses\/?$/, "/models");
 
+  const registerProvider = config.registerProvider !== false;
+  // 观察名单：手工 provider（默认 qwentokenplan）+ 本插件自身。媒体工具门控同用此名单。
+  const watchedProviders = Array.isArray(config.watchedProviders)
+    ? config.watchedProviders.map(String) : ["qwentokenplan"];
+  const watched = new Set([providerId, ...watchedProviders]);
+
   const overrides = Array.isArray(config.models) ? config.models : [];
   const excludes = Array.isArray(config.excludeModels) ? config.excludeModels.map(String) : [];
   const refreshMinutes = Number.isFinite(config.catalogRefreshMinutes) && config.catalogRefreshMinutes >= 1
@@ -98,17 +116,26 @@ export function apply(ctx, config = {}) {
   // 服务端权益调用预算：上限按 Token Plan 等级自动推导（网关 quota-config ÷ perCallCredits）。
   const budget = new HarnessBudget({ config, logger: ctx.logger });
 
+  // 目录补货器：聊天固定走普通线路时，新模型由这里补进普通线路的名单（见 lib/catalog-feed.js）。
+  const feed = config.catalogFeed === false ? null : new CatalogFeed({
+    ctx, catalog, feedProvider: String(config.feedProvider || "qwentokenplan"),
+    feedReasoning: config.feedReasoning !== false,
+    pluginName: name, fetchImpl: proxyFetch, logger: ctx.logger,
+  });
+
   const adapter = new QwenTokenPlanAdapter({
     ctx, catalog, providerId, displayName, apiKeyEnv, endpoint, chatEndpoint, harnessMode,
     pluginName: name, budget, fetchImpl: proxyFetch,
   });
 
-  ctx.llm.registerConfigurableProviders([{
-    provider: providerId,
-    displayName,
-    settingsNs: ctx.fiber.entry?.options.id ?? "qwen-token-plan-full",
-    settingsPath: [],
-  }]);
+  if (registerProvider) {
+    ctx.llm.registerConfigurableProviders([{
+      provider: providerId,
+      displayName,
+      settingsNs: ctx.fiber.entry?.options.id ?? "qwen-token-plan-full",
+      settingsPath: [],
+    }]);
+  }
 
   let stopped = false;
   const lifetime = new AbortController();
@@ -203,7 +230,29 @@ export function apply(ctx, config = {}) {
     if (updated && !stopped) ctx.llm.emitAdaptersUpdated();
     return updated;
   });
-  const catalogTick = () => { if (!stopped) refreshCatalog().catch(() => {}); };
+  // 目录刷新后顺带补货。关键坑（2026-11-17 实测）：HMR 事务用 AsyncLocalStorage 标记，
+  // 异步链会继承——启动 tick 生在事务里，延后多久的定时器回调都仍带标记，直接调
+  // configEditor.edit 必报 "HMR transactions cannot be nested"。而 HTTP 处理器跑在
+  // webServer 启动时的干净上下文里，所以补货经「回环自触发」执行：定时端只发一个
+  // loopback POST /feed，真正的 edit 在服务端处理器里做。无 webServer 的组合（headless）
+  // 没有 HMR，直接调即可。
+  const triggerFeed = () => {
+    if (stopped || !feed) return;
+    let origin;
+    try { origin = ctx.get?.("webServer")?.getOrigin?.(); } catch { /* 监听未绑定 */ }
+    if (!origin) { feed.run().catch(() => {}); return; }
+    // 必须用原生 fetch 直连回环，不能走 proxyFetch（代理会把本机请求绕出去）。
+    globalThis.fetch(`${origin}${ROUTE_PREFIX}/feed`, { method: "POST", signal: AbortSignal.timeout(60_000) })
+      .catch(() => { /* 触发失败等下一周期或面板手动刷新 */ });
+  };
+  const catalogTick = () => {
+    if (stopped) return;
+    refreshCatalog().catch(() => {}).then(() => {
+      if (stopped || !feed) return;
+      if (typeof ctx.timeout === "function") ctx.timeout(triggerFeed, 5_000);
+      else setTimeout(triggerFeed, 5_000);
+    });
+  };
   const tierTick = () => { if (!stopped) refreshTier().catch(() => {}); };
 
   const statusPayload = () => {
@@ -219,17 +268,67 @@ export function apply(ctx, config = {}) {
         catalogSource: snapshot.source,
         catalogSyncedAt: snapshot.syncedAt ?? null,
       },
+      // 观察模式状态：registerProvider=false 时聊天不经过本插件，计数来自 session/event 旁路。
+      observe: { registerProvider, watchedProviders: [...watched] },
+      // 目录补货状态：lastAdded/lastError/seenCount 供面板与排查。
+      feed: feed ? feed.status() : { enabled: false },
     };
   };
 
   // —— 资源全部挂 ctx.effect：清理函数由 Cordis 在 fiber dispose 时执行（热切换不泄漏）。——
 
+  if (registerProvider) {
+    ctx.effect(() => {
+      const handle = ctx.llm.registerAdapter([providerId], adapter);
+      return () => {
+        try { if (typeof handle === "function") handle(); else handle?.dispose?.(); } catch { /* best effort */ }
+      };
+    }, "qwen-token-plan-full: adapter");
+  }
+
+  // 旁路调用观察器：订阅 session/event（只读事后广播，监听器异常被宿主隔离，绝不反向影响请求）。
+  // 聊天走手工 provider（pi-ai）时，adapter 内的计数够不着这些请求，这里补上：
+  // - provider 识别首选 assistant/message 内嵌 finish chunk 的 replayState.response.provider
+  //   （pi-ai 每条消息都带，插件热重载后会话中途也能立即识别）；
+  // - 兜底用 request/context、request/header 跟踪会话当前 provider（覆盖不带 replayState 的适配器）。
+  // 只计成功落定的 assistant/message（一次 = 一次 API 调用）；失败 attempt 不计（NO_ADAPTER 等根本没出门）。
+  // 会话恢复/重放不发 session/event，不会重复计数；WeakMap 随会话对象回收，无泄漏。
   ctx.effect(() => {
-    const handle = ctx.llm.registerAdapter([providerId], adapter);
-    return () => {
-      try { if (typeof handle === "function") handle(); else handle?.dispose?.(); } catch { /* best effort */ }
+    const sessionProviders = new WeakMap();
+    const providerOfMessage = (event) => {
+      const stream = event?.data?.stream;
+      if (!Array.isArray(stream)) return undefined;
+      for (const entry of stream) {
+        const chunk = entry?.chunk;
+        if (chunk?.type === "finish") {
+          const p = chunk.replayState?.response?.provider;
+          if (typeof p === "string" && p) return p;
+        }
+      }
+      return undefined;
     };
-  }, "qwen-token-plan-full: adapter");
+    const onSessionEvent = (session, event) => {
+      try {
+        const type = event?.type;
+        if (type === "request/context") {
+          const p = event.data?.provider;
+          if (typeof p === "string" && p) sessionProviders.set(session, p);
+          return;
+        }
+        if (type === "request/header") {
+          const p = event.data?.header?.config?.provider;
+          if (typeof p === "string" && p) sessionProviders.set(session, p);
+          return;
+        }
+        if (type === "assistant/message") {
+          const p = providerOfMessage(event) ?? sessionProviders.get(session);
+          if (p && watched.has(p)) budget.recordRequest();
+        }
+      } catch { /* 观察器永不影响会话事件流 */ }
+    };
+    const off = ctx.on("session/event", onSessionEvent);
+    return () => { try { if (typeof off === "function") off(); else ctx.off?.("session/event", onSessionEvent); } catch { /* best effort */ } };
+  }, "qwen-token-plan-full: usage observer");
 
   if (config.mediaTools !== false && typeof ctx.tools?.register === "function") {
     const imageModels = Array.isArray(config.imageModels) && config.imageModels.length
@@ -242,7 +341,7 @@ export function apply(ctx, config = {}) {
         imageModels, videoModels,
         defaultImageModel: String(config.defaultImageModel || imageModels[0]),
         defaultVideoModel: String(config.defaultVideoModel || videoModels[0]),
-        providerId, fetchImpl: proxyFetch,
+        providerId, acceptProviders: watchedProviders, fetchImpl: proxyFetch,
         logger: ctx.logger,
         budget,
       });
@@ -271,8 +370,15 @@ export function apply(ctx, config = {}) {
             return json(res, 200, statusPayload());
           }
           if (req.method === "POST" && sub === "refresh") {
-            await Promise.allSettled([refreshTier(), refreshCatalog(), refreshEquities()]);
+            await Promise.allSettled([refreshTier(), refreshCatalog(), refreshEquities(), ...(feed ? [feed.run()] : [])]);
             return json(res, 200, statusPayload());
+          }
+          // 补货触发端点：定时端经回环 POST 到这里，edit 跑在 HTTP 的干净异步上下文，
+          // 避开 HMR 事务的 AsyncLocalStorage 继承（见 catalogTick 注释）。
+          if (req.method === "POST" && sub === "feed") {
+            if (!feed) return json(res, 404, { error: "feed disabled" });
+            const r = await feed.run();
+            return json(res, 200, { ...statusPayload(), feedResult: r });
           }
           // 面板「一键登录」：开 Chrome 登录页并进入收割轮询；结果由后续 status 轮询带回。
           if (req.method === "POST" && sub === "login") {
@@ -313,9 +419,10 @@ export function apply(ctx, config = {}) {
   }, "qwen-token-plan-full: timers");
 
   ctx.logger?.info?.(
-    `${name}: 已注册 provider "${providerId}"（Responses=${endpoint}；Chat=${chatEndpoint}；` +
+    `${name}: ${registerProvider ? `已注册 provider "${providerId}"` : "观察-only（未注册 provider）"}（Responses=${endpoint}；Chat=${chatEndpoint}；` +
     `内置工具 ${harnessMode.mode}；权益预算 ${budget.enabled ? "开启（等级自动上限）" : "关闭"}；` +
-    `媒体工具 ${config.mediaTools === false ? "关闭" : "开启"}；目录每 ${refreshMinutes} 分钟刷新；` +
+    `媒体工具 ${config.mediaTools === false ? "关闭" : "开启"}；调用观察 ${[...watched].join("/")}；` +
+    `目录补货 ${feed ? `开启 → ${String(config.feedProvider || "qwentokenplan")}${config.feedReasoning === false ? "（不含档位）" : ""}` : "关闭"}；目录每 ${refreshMinutes} 分钟刷新；` +
     `套餐每 ${tierRefreshHours} 小时刷新；Cookie 失效${config.autoRelogin === false ? "不会" : "将"}自动开登录页收割）`,
   );
 }

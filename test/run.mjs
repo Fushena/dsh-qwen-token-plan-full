@@ -9,7 +9,7 @@ const executable = existsSync(electron) ? electron : process.execPath;
 // - 一次 --test 多文件：child 进程同样踩 c: 坑。
 // 相对路径避开 drive letter 与编码两坑；cwd 锁定仓库根，与手工单跑等价。
 const root = fileURLToPath(new URL('..', import.meta.url));
-const files = ['compat.test.js', 'relogin.test.js', 'stream.test.js', 'tier-retry.test.js', 'route-guard.test.mjs', 'model-display.test.mjs'];
+const files = ['compat.test.js', 'relogin.test.js', 'stream.test.js', 'tier-retry.test.js', 'route-guard.test.mjs', 'model-display.test.mjs', 'catalog-feed.test.mjs', 'observer.test.mjs'];
 let failed = 0;
 for (const file of files) {
   const result = spawnSync(executable, ['--import', './test/runtime.mjs', '--test', `./test/${file}`], {
