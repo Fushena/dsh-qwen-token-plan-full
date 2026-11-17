@@ -48,7 +48,8 @@ test('sortModels groups families and orders newest first inside each group', () 
     'deepseek-v4-flash-0731',
     // 智谱（order 2）：5.3 在 5.2 上
     'glm-5.3', 'glm-5.2',
-    // 千问（order 5）：3.8 > 3.7 > 3.6；同版本 max 先于 flash/plus
+    // 千问（order 5）：4 > 3.8 > 3.7 > 3.6；同版本 max 先于 flash/plus
+    'qwen4-max',
     'qwen3.8-max', 'qwen3.8-flash',
     'qwen3.7-max', 'qwen3.7-plus',
     'qwen3.6-flash',

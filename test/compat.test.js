@@ -67,6 +67,34 @@ test('model defaults and aliases resolve for both request protocols',async()=>{
 test('rejected GLM efforts are refused before any HTTP request',async()=>{
   await assert.rejects(buildChatRequestBody(opts({reasoningEffort:'none'}),BUILTIN_CATALOG.models.find(m=>m.transport==='chat' && m.rejectedReasoningEfforts?.includes('none'))),e=>e.code==='UNSUPPORTED_OPTION');
 });
+test('qwen4-max advertises image input and its documented output ceiling (2026-11-17 regression)',async()=>{
+  // 回归：出厂快照（2026-11-03）没有 qwen4-max，动态发现的 generateUnknown() 一律按
+  // input:["text"] + maxTokens 65536 保守推断 → 宿主认定不能收图（lib/adapter.js 的
+  // inputModalities），装配时还会抛 UNSUPPORTED_CONTENT。这里钉死正式条目已进目录。
+  const model=BUILTIN_CATALOG.models.find(m=>m.id==='qwen4-max');
+  assert.ok(model,'qwen4-max 必须在出厂目录里，不能退回动态兜底');
+  assert.deepEqual(model.input,['text','image']);
+  assert.equal(model.contextWindow,1000000);
+  assert.equal(model.maxTokens,393216);
+  const adapter=new QwenTokenPlanAdapter({ctx:{get:()=>undefined},catalog:new DynamicCatalog({ctx:{get:()=>undefined},modelsUrl:'https://example.invalid/models',apiKeyEnv:'TEST',pluginName:'test'}),providerId:'p',displayName:'d',apiKeyEnv:'TEST',endpoint:'https://example.invalid/responses',harnessMode:normalizeHarnessMode('auto'),pluginName:'test'});
+  const listed=(await adapter.listModels()).find(m=>m.id==='qwen4-max');
+  assert.deepEqual(listed.inputModalities,['text','image'],'上报宿主的模态必须含 image');
+  const resolved=await adapter.resolveModel('p','qwen4-max');
+  assert.equal(resolved.defaultMaxTokens,393216);
+  assert.deepEqual(resolved.reasoning.efforts.map(e=>e.id),['none','low','medium','xhigh']);
+  assert.equal(resolved.reasoning.defaultEffort,'xhigh');
+  // 官方文档只列 low/medium/xhigh，但 Token Plan 实测（2026-11-17）none 也被接受
+  // 且 reasoning_tokens=0：保留 none 档，让 normal 模式可用（退回本地函数）。
+  assert.equal((await buildRequestBody(opts({reasoningEffort:'none'}),model,undefined,model.harnessTools)).reasoning.effort,'none');
+  assert.equal((await buildRequestBody(opts({reasoningEffort:'high'}),model,undefined,[])).reasoning.effort,'xhigh');
+  assert.equal((await buildRequestBody(opts(),model,undefined,[])).max_output_tokens,393216);
+  // 真正的回归点：带图请求必须装配成 input_image，而不是在本地就抛「不支持图片输入」。
+  const attachments={readImage:async()=>({ref:{mediaType:'image/png'},data:Buffer.from([137,80,78,71])})};
+  const withImage=await buildRequestBody(opts({messages:[{role:'user',content:[{type:'image',attachment:'a1'},{type:'text',text:'什么颜色？'}]}]}),model,attachments,model.harnessTools);
+  const parts=withImage.input.find(item=>item.role==='user').content;
+  assert.equal(parts[0].type,'input_image');
+  assert.ok(parts[0].image_url.startsWith('data:image/png;base64,'));
+});
 test('DSH 0.2 tool result messages retain call ids on both protocols',async()=>{
   const messages=[{role:'assistant',content:[{type:'tool-call',id:'call_1',name:'web_search',arguments:'{"q":"x"}'}]}, {role:'tool',toolCallId:'call_1',content:[{type:'text',text:'result'}]}];
   const r=await buildRequestBody(opts({messages}),qwen,undefined,[]);

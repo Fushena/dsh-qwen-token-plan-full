@@ -5,6 +5,46 @@
   "reasoningProbedAt": "2026-11-03T06:57:32.269Z",
   "models": [
     {
+      "id": "qwen4-max",
+      "brand": "千问",
+      "capabilities": "推理模型、视觉理解、文本生成",
+      "reasoning": true,
+      "reasoningEfforts": [
+        "none",
+        "low",
+        "medium",
+        "xhigh"
+      ],
+      "defaultReasoningEffort": "xhigh",
+      "acceptedReasoningEfforts": [
+        "none",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "rejectedReasoningEfforts": [],
+      "reasoningAliases": {
+        "high": "xhigh",
+        "max": "xhigh"
+      },
+      "input": [
+        "text",
+        "image"
+      ],
+      "contextWindow": 1000000,
+      "maxTokens": 393216,
+      "harnessTools": [
+        "web_search",
+        "code_interpreter",
+        "web_extractor",
+        "web_search_image",
+        "image_search"
+      ]
+    },
+    {
       "id": "qwen3.8-max",
       "brand": "千问",
       "capabilities": "推理模型、视觉理解、文本生成",
