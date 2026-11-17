@@ -1,0 +1,4 @@
+# 测试/实跑产物：媒体工具在解析不到会话工作目录时会落到 cwd（test 里就是仓库根）
+qwen-image-*.png
+qwen-video-*.mp4
+node_modules/

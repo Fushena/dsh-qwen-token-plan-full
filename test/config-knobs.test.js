@@ -86,8 +86,15 @@ function fakeCtx() {
     },
     effect(fn) { cleanups.push(fn()); },
     fiber: {},
-    get: (name) => (name === 'credentials' ? credentials : undefined),
+    // workingDirectory 必须给：媒体工具解析不到会话目录时会退回 process.cwd()，
+    // 于是测试把 qwen-image-*.png 直接拉进仓库根（2026-11-17 实测 11 个）。
+    // 指向测试自己的临时 HOME，随 rmSync 一起清掉。
+    get: (name) => (name === 'credentials' ? credentials
+      : name === 'workingDirectory' ? { defaultDirectory: () => process.env.HOME } : undefined),
     credentials,
+    // 0.4.0 起的旁路调用观察器要订阅 session/event；假 ctx 必须提供 on，
+    // 否则 apply 会在观察器 effect 里抛 ctx.on is not a function。
+    on: () => () => {},
     timeout: () => () => {},
     interval: () => () => {},
     logger: { info() {}, warn() {}, debug() {} },
@@ -337,6 +344,54 @@ test('第一个模型请求必须等站点判定落地：国际站 key 的首轮
     assert.ok(
       chatHits[0].startsWith('https://token-plan.ap-southeast-1.maas.aliyuncs.com/'),
       `首轮必须打判定出来的站点，实际：${chatHits[0]}`,
+    );
+  } finally {
+    releaseProbe();
+    for (const cleanup of cleanups.reverse()) { try { cleanup?.(); } catch { /* best effort */ } }
+    globalThis.fetch = prevFetch;
+    if (prevHome === undefined) delete process.env.HOME; else process.env.HOME = prevHome;
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('观察-only（registerProvider=false）时媒体工具也要等站点判定：聊天不经过 adapter，门控够不着', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'qtpf-observe-gate-'));
+  const prevHome = process.env.HOME;
+  const prevFetch = globalThis.fetch;
+  process.env.HOME = home;
+  const imageHits = [];
+  let releaseProbe;
+  const probeGate = new Promise((resolve) => { releaseProbe = resolve; });
+  globalThis.fetch = async (url) => {
+    const href = String(url);
+    if (href.endsWith('/models')) {
+      await probeGate;
+      if (href.includes('cn-beijing')) return new Response('{"code":"InvalidApiKey"}', { status: 401 });
+      return Response.json({ data: [{ id: 'qwen3.8-flash' }] });
+    }
+    if (href.includes('/chat/completions')) {
+      imageHits.push(href);
+      if (href.includes('cn-beijing')) return new Response('{"code":"InvalidApiKey"}', { status: 401 });
+      return Response.json({ choices: [{ message: { content: [{ type: 'image', image: 'https://example.com/c.png' }] } }] });
+    }
+    return new Response(new Uint8Array([137, 80, 78, 71]), { status: 200, headers: { 'content-type': 'image/png' } });
+  };
+  const { ctx, cleanups, registered, tools } = endpointCtx();
+  try {
+    apply(ctx, Config({ registerProvider: false, proxy: 'none', autoRelogin: false }));
+    assert.equal(registered.length, 0, '观察-only 不该注册 adapter（上游 0.4.0 语义）');
+    const imageTool = tools.find((def) => def.name === 'qwen_generate_image');
+    assert.ok(imageTool, '观察-only 下媒体工具仍然注册');
+    // 判定还没落地就生图：媒体工具自己发请求，不经过 adapter.stream 的门控。
+    const generated = imageTool.execute({ prompt: 'a cat', n: 1 }, { signal: undefined }).catch(() => {});
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(imageHits.length, 0, '判定未落地时不得发出生图请求（跨站点 401 不可重试）');
+    releaseProbe();
+    await generated;
+    assert.ok(imageHits.length >= 1, '判定落地后放行生图');
+    assert.ok(
+      imageHits.every((href) => href.startsWith('https://token-plan.ap-southeast-1.maas.aliyuncs.com/')),
+      `生图必须打判定出来的站点，实际：${imageHits.join(' | ')}`,
     );
   } finally {
     releaseProbe();
