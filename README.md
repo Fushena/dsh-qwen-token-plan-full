@@ -88,52 +88,6 @@ dsh plugin --profile <profile> add link:/绝对路径/dsh-qwen-token-plan-full
 | `tier` | `auto` | 网关不可达时的兜底等级：`lite`/`essential`/`standard`/`pro` |
 | `tierRefreshHours` | `1` | 等级/配额刷新周期（小时） |
 | `consoleCookieEnv` | `BAILIAN_CONSOLE_COOKIE` | 控制台 Cookie 的凭据名（~/.dsh/.env 或环境变量） |
-| `registerProvider` | `true` | `false` = 观察-only：不注册 adapter/provider（模型从选择器消失），面板/计数/媒体工具照常。徽标门控自 v0.4.0 起跟随 `watchedProviders`（宿主 status 下发），普通线路下也显示 |
-| `watchedProviders` | `["qwentokenplan"]` | 旁路观察名单：这些 provider 的调用也计入面板「本周期调用次数」（本插件 providerId 始终在内）；媒体工具门控同用此名单 |
-| `catalogFeed` | `true` | 目录补货：定期从普通线路自己的域名抓 /models，把新对话模型追加进 pi-ai 该线路的 models 配置 |
-| `feedProvider` | `qwentokenplan` | 补货目标：llm-pi-ai 里手工配的 provider 路由名 |
-| `feedReasoning` | `true` | 补货时是否翻译推理档位（reasoningEfforts + compat.thinkingFormat）；false 只补 id/name/容量/模态 |
-
-## 旁路调用观察（v0.4.0 起）
-
-聊天不必经过本插件的 adapter，面板也能看到真实调用数：插件订阅 DSH 的 `session/event`
-只读事件流（事后广播，监听器异常被宿主隔离，绝不反向影响请求），在 `assistant/message`
-落定时按 provider 计一次调用。provider 识别首选消息内嵌 finish chunk 的
-`replayState.response.provider`（pi-ai 每条都带），兜底用 `request/context`/`request/header`
-跟踪会话当前 provider。会话恢复/重放不发该事件，不会重复计数；失败 attempt 不计。
-
-典型用法：聊天固定走手工 provider（如 llm-pi-ai 的 `qwentokenplan`），本插件只负责
-面板/权益/媒体工具——这样修改插件触发热重载时，聊天请求不会被中断（v0.3.6 及以前，
-选中本插件 provider 的会话在插件重载瞬间会报 `NO_ADAPTER` 整轮中断）。需要服务端内置
-工具（联网搜索/代码解释器等）时，保持 `registerProvider: true` 并手动选本插件的模型。
-
-`totalCalls` 口径自 v0.4.0 起统一为「模型 API 调用次数」（含图片/视频生成任务），
-不再混计内置工具事件；权益次数仍按工具事件/生成张数单独累计。
-
-## 目录补货（v0.4.0 起）
-
-聊天固定走普通线路（llm-pi-ai 手工 provider）后，新模型上线由插件自动补进普通线路的名单：
-
-1. 每次目录刷新（默认 30 分钟）后，用**普通线路自己的 baseURL 与 Key** 抓 `GET {baseURL}/models`
-   （两个网关域名清单可能不同，必须抓普通线路真能服务的那份）；
-2. 过滤非对话模型（生成/语音/embedding）与已有/已补过的 id，只留**新**对话模型；
-3. 把本插件目录里的模型档案翻译成 pi-ai 条目：`name/contextWindow/maxTokens/input`，
-   推理模型再附 `reasoningEfforts`（键=可选档位 off/minimal/low/medium/high/xhigh/max，
-   值=线上拼写，按模型 aliases/accepted/rejected 推导）与 `compat.thinkingFormat`
-   （千问=qwen、DeepSeek=deepseek、GLM=zai）；没有档案的模型只写 id/name，容量吃路由默认值；
-4. 经 `ctx.configEditor.edit()` **只追加**进该线路 `models`（已有条目/其它 provider 分毫不动），
-   pi-ai schema 整体校验通过才落盘；pi-ai 官方保证 models 改动下一请求生效、免重启。
-
-纪律：**真变化才写**（差集为空不碰配置文件）；补过的 id 记入
-`~/.dsh/qwen-token-plan-full.feed.json` 的 `seen`——用户手动删掉的模型不会被塞回来。
-不选档位时 pi-ai 不发推理字段，已有行为零变化；档位翻译整体可用 `feedReasoning: false` 关掉。
-状态见 status 路由 `feed` 字段（lastFeedAt/lastAdded/lastError/seenCount），面板「刷新」也会触发补货。
-
-实现细节：周期补货经**回环自触发**（定时端 POST 本机 `/qwen-token-plan-full/feed`，
-edit 在 HTTP 处理器的干净异步上下文执行）。原因：HMR 事务用 AsyncLocalStorage 标记且
-异步链继承，插件启动 tick 里直接/延后调 `configEditor.edit` 都会报
-"HMR transactions cannot be nested"（2026-11-17 实测）；HTTP 处理器生于应用启动、
-不带事务标记。无 webServer 的组合（headless，无 HMR）退回直接调用。
 
 ## 出站代理（`proxy`）
 

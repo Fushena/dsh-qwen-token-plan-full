@@ -4,7 +4,6 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { apply } from '../index.js';
-import { isolateHome } from './home.mjs';
 
 /**
  * 启动兜底重试必须「一次性」（2026-11-13 修复）。
@@ -28,7 +27,6 @@ function fakeCtx() {
       emitAdaptersUpdated() {},
     },
     effect(fn) { cleanups.push(fn()); },
-    on: () => () => {},
     fiber: {},
     get: (name) => (name === 'credentials' ? credentials : undefined),
     credentials,
@@ -41,8 +39,10 @@ function fakeCtx() {
 
 test('tier fallback retry is one-shot: repeated failures never reschedule the 60s timer', async () => {
   // HOME 隔离：HarnessBudget 默认落盘 ~/.dsh/...，不得污染真实状态。
-  const { home, restore } = isolateHome('qtpf-retry-');
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'qtpf-retry-'));
+  const prevHome = process.env.HOME;
   const prevFetch = globalThis.fetch;
+  process.env.HOME = home;
   let fetchCalls = 0;
   globalThis.fetch = async () => { fetchCalls += 1; throw new TypeError('fetch failed'); };
   const { ctx, timeouts, cleanups } = fakeCtx();
@@ -71,6 +71,7 @@ test('tier fallback retry is one-shot: repeated failures never reschedule the 60
   } finally {
     for (const cleanup of cleanups.reverse()) { try { cleanup?.(); } catch { /* best effort */ } }
     globalThis.fetch = prevFetch;
-    restore();
+    if (prevHome === undefined) delete process.env.HOME; else process.env.HOME = prevHome;
+    fs.rmSync(home, { recursive: true, force: true });
   }
 });

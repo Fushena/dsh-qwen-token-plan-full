@@ -5,7 +5,6 @@ import os from 'node:os';
 import path from 'node:path';
 import { isCookieFailure, cookieFailureKind, updateEnvFile, ReloginFlow } from '../lib/relogin.js';
 import { Config } from '../index.js';
-import { isolateHome } from './home.mjs';
 
 test('cookie failure signatures match only cookie-class gateway errors', () => {
   assert.equal(isCookieFailure('user/info.json 未返回 secToken（Cookie 可能已过期）'), true);
@@ -87,7 +86,9 @@ test('missing cookie pops immediately on first sight', async () => {
 });
 
 test('auto cooldown is 2h; manual start bypasses it', async () => {
-  const { home, restore } = isolateHome('qtpf-cool-');
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'qtpf-cool-'));
+  const prev = process.env.HOME;
+  process.env.HOME = home;
   try {
     fs.mkdirSync(path.join(home, '.dsh'), { recursive: true });
     const calls = { open: 0, close: 0 };
@@ -124,7 +125,8 @@ test('auto cooldown is 2h; manual start bypasses it', async () => {
     assert.equal(r.ok, true);
     assert.equal(calls.open, 2, '手动一键登录永远可用');
   } finally {
-    restore();
+    if (prev === undefined) delete process.env.HOME; else process.env.HOME = prev;
+    fs.rmSync(home, { recursive: true, force: true });
   }
 });
 
@@ -219,7 +221,9 @@ test('failed auto start does not consume the 2h cooldown (self-heals next refres
 });
 
 test('updateEnvFile replaces in place, appends when missing, keeps other keys', () => {
-  const { home, restore } = isolateHome('qtpf-env-');
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'qtpf-env-'));
+  const prev = process.env.HOME;
+  process.env.HOME = home;
   try {
     const file = path.join(home, '.dsh', '.env');
     fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -230,8 +234,7 @@ test('updateEnvFile replaces in place, appends when missing, keeps other keys', 
     assert.match(text, /^BAILIAN_CONSOLE_COOKIE=cna=z; login_qianwenai_ticket=tk;$/m);
     assert.match(text, /^QWEN_TOKEN_PLAN_CN_API_KEY=sk-x$/m);
     assert.equal(text.match(/BAILIAN_CONSOLE_COOKIE=/g)?.length, 1);
-    // Windows 无 POSIX 权限位（chmod 只映射只读属性），该断言仅 Unix 成立。
-    if (process.platform !== 'win32') assert.equal((fs.statSync(file).mode & 0o777).toString(8), '600');
+    assert.equal((fs.statSync(file).mode & 0o777).toString(8), '600');
     // 键不存在时追加。
     updateEnvFile('NEW_KEY', 'v');
     assert.match(fs.readFileSync(file, 'utf8'), /^NEW_KEY=v$/m);
@@ -244,7 +247,8 @@ test('updateEnvFile replaces in place, appends when missing, keeps other keys', 
     updateEnvFile('BAILIAN_CONSOLE_COOKIE', 'x=$&y$1');
     assert.match(fs.readFileSync(file, 'utf8'), /^BAILIAN_CONSOLE_COOKIE=x=\$&y\$1$/m);
   } finally {
-    restore();
+    if (prev === undefined) delete process.env.HOME; else process.env.HOME = prev;
+    fs.rmSync(home, { recursive: true, force: true });
   }
 });
 
@@ -277,9 +281,11 @@ function loggedInBridge({ cookie = 'cna=x; login_qianwenai_ticket=tk', tabId = 7
 }
 
 function tempHome() {
-  const { home, restore } = isolateHome('qtpf-silent-');
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'qtpf-silent-'));
   fs.mkdirSync(path.join(home, '.dsh'), { recursive: true }); // updateEnvFile 不建目录，与生产一致（DSH home 已存在）
-  return { home, restore };
+  const prev = process.env.HOME;
+  process.env.HOME = home;
+  return { home, restore: () => { if (prev === undefined) delete process.env.HOME; else process.env.HOME = prev; fs.rmSync(home, { recursive: true, force: true }); } };
 }
 
 test('missing cookie + Chrome already logged in: auto path silently harvests, never opens a login page', async () => {
