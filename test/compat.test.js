@@ -276,9 +276,14 @@ test('adapter request timeout and network failures become retryable codes',async
 });
 
 test('video tool forwards duration and clamps invalid values',async()=>{
+  // 产物必须落在本例自己的临时目录：这条用例真的会下载三次视频。原先写死 '/tmp'，
+  // 每跑一次测试就在系统临时目录里留三个文件（实测累积到 126 个），既污染 /tmp
+  // 又让「测试不留残留」这条卫生要求形同虚设。
+  const dir=mkdtempSync(path.join(os.tmpdir(),'qtpf-vid-'));
+  try {
   const definitions=[];const submits=[];
   const credentials={resolve:async()=>({value:'fixture'})};
-  const workingDirectory={ensure:async()=>'/tmp'};
+  const workingDirectory={ensure:async()=>dir};
   const ctx={get:name=>name==='credentials'?credentials:workingDirectory,tools:{register:def=>{definitions.push(def);return ()=>{};}}};
   // 提交即成功（task_status=SUCCEEDED + video_url），跳过轮询等待；下载 URL 返回小文件流。
   const dispose=registerMediaTools(ctx,{apiKeyEnv:'TEST',pluginName:'test',origin:'https://example.invalid',chatEndpoint:'https://example.invalid/chat',imageModels:['image'],videoModels:['video'],defaultImageModel:'image',defaultVideoModel:'video',fetchImpl:async(u,init)=>{
@@ -298,6 +303,7 @@ test('video tool forwards duration and clamps invalid values',async()=>{
   assert.equal(submits[1].parameters?.duration,undefined);
   assert.equal(submits[2].parameters,undefined);
   dispose();
+  } finally { rmSync(dir,{recursive:true,force:true}); }
 });
 
 test('image tool rejects n above remaining image entitlement before charging',async()=>{

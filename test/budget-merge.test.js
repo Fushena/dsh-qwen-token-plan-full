@@ -1,0 +1,299 @@
+// 记账合并与时钟回拨回归测试（2026-11-18）。
+//
+// 为什么这些测试存在：千问 Token Plan 权益耗尽后上游不自动停，超出部分按目录价
+// 88 折后付费。预算模块的唯一职责是「宁可少算余额，绝不多算」——多算就会继续
+// 声明已耗尽的权益工具，用户被真金白银扣钱。
+//
+// 缺陷 A：#save 整份内存快照 rename 覆盖磁盘，双开/热重载并存实例互相吞计数
+//         （实测两实例共 3 次调用落盘 totalCalls=1）→ 余额高估 → 套餐外后付费。
+// 缺陷 B：时钟回拨后 Date.now() - fetchedAt 为负，恒不大于新鲜度阈值 →
+//         官网快照永不过期（实测回拨 1 小时仍判 official 新鲜）。
+//
+// 全部离线：临时目录当 HOME（isolateHome），显式 filePath 落在临时目录内，
+// 绝不触碰真实 ~/.dsh/qwen-token-plan-full.budget.json；结束 rmSync 清理。
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
+import { isolateHome } from "./home.mjs";
+import { HarnessBudget } from "../lib/budget.js";
+
+const DAY_MS = 86_400_000;
+
+/** 每个用例独立的临时 HOME + 状态文件路径 + 日志收集器。 */
+function setup(t, name = "budget.json") {
+  const { home, restore } = isolateHome("qtpf-merge-");
+  t.after(restore); // 结束必须清理临时目录
+  const filePath = path.join(home, ".dsh", name);
+  const warns = [];
+  const infos = [];
+  const logger = {
+    debug: () => {},
+    info: (m) => infos.push(m instanceof Error ? m.message : String(m)),
+    warn: (m) => warns.push(m instanceof Error ? m.message : String(m)),
+  };
+  const writeState = (obj) => {
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.writeFileSync(filePath, JSON.stringify(obj));
+  };
+  const readState = () => JSON.parse(fs.readFileSync(filePath, "utf8"));
+  return { home, filePath, logger, warns, infos, writeState, readState };
+}
+
+/** 网关等级信息（standard 有本地配额定义，便于断言 local 兜底口径）。 */
+function tier(now, resetTime = now + 20 * DAY_MS) {
+  return {
+    specCode: "standard",
+    monthlyCredits: 45000,
+    fiveHourCredits: 3000,
+    resetTime,
+    source: "gateway",
+    fetchedAt: now,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 缺陷 A：跨实例整份覆写
+// ---------------------------------------------------------------------------
+
+test("A1 跨实例交替 recordRequest：落盘 totalCalls 等于真实总次数", (t) => {
+  const { filePath, logger, readState } = setup(t);
+  const a = new HarnessBudget({ filePath, logger });
+  const b = new HarnessBudget({ filePath, logger });
+  // 双开 DSH / 热重载新旧并存：两个实例交替记账，共 3 次真实调用。
+  a.recordRequest();
+  b.recordRequest();
+  a.recordRequest();
+  assert.equal(readState().totalCalls, 3, "整份覆写会把计数吞成 1~2");
+  // 最后落盘的实例内存应与磁盘一致。
+  assert.equal(a.status().usage.totalCalls, 3);
+  // 再记一次：后落盘实例应把磁盘现值合并进来，而不是用自己的旧快照盖回去。
+  b.recordRequest();
+  assert.equal(readState().totalCalls, 4);
+  assert.equal(b.status().usage.totalCalls, 4);
+  // tmp 文件不得残留（pid 后缀之外还要防同进程撞车）。
+  assert.ok(!fs.readdirSync(path.dirname(filePath)).some((f) => f.includes(".tmp-")));
+});
+
+test("A2 跨实例交替 record：byEquity 按增量累加，不互吞", (t) => {
+  const { filePath, logger, readState } = setup(t);
+  const a = new HarnessBudget({ filePath, logger });
+  const b = new HarnessBudget({ filePath, logger });
+  a.record("web_search"); // search_pro +1
+  b.record("web_search"); // search_pro +1
+  a.record("web_search", 2); // search_pro +2
+  b.record("web_search"); // search_pro +1 → 共 5
+  a.record("image_generation"); // image_generation +1
+  b.record("image_generation"); // image_generation +1 → 共 2
+  const disk = readState();
+  assert.equal(disk.byEquity.search_pro, 5);
+  assert.equal(disk.byEquity.image_generation, 2);
+});
+
+test("A3 周期边界：磁盘已滚入新周期，本实例旧周期计数不得覆写回去", (t) => {
+  const { filePath, logger, writeState, readState } = setup(t);
+  const now = Date.now();
+  // 本实例加载时还停在旧周期（锚点已过期，计数 90）。
+  writeState({
+    periodAnchor: now - 1000,
+    totalCalls: 90,
+    byEquity: { search_pro: 90 },
+    tier: tier(now, 0),
+  });
+  const a = new HarnessBudget({ filePath, logger });
+  // 另一实例已结算旧周期并滚入新周期（锚点在未来，新周期计数 7）。
+  const newAnchor = now + 20 * DAY_MS;
+  writeState({
+    periodAnchor: newAnchor,
+    totalCalls: 95,
+    byEquity: { search_pro: 7 },
+    tier: tier(now, newAnchor),
+  });
+  // setEquities(null) 是不触发 rollover 的落盘路径：本实例内存锚点仍是旧的。
+  a.setEquities(null);
+  const disk = readState();
+  assert.equal(disk.periodAnchor, newAnchor, "不得把旧周期锚点写回去");
+  assert.equal(disk.byEquity.search_pro, 7, "旧周期 90 次不属于新周期，不可比大小");
+  assert.equal(disk.totalCalls, 95, "totalCalls 是跨周期累计，无新增则保持磁盘现值");
+});
+
+test("A3b 周期边界：本实例已滚入新周期，磁盘旧周期计数不得 max 进来", (t) => {
+  const { filePath, logger, writeState, readState } = setup(t);
+  const now = Date.now();
+  const newAnchor = now + 20 * DAY_MS;
+  writeState({
+    periodAnchor: now - 1000, // 已过期
+    totalCalls: 90,
+    byEquity: { search_pro: 90 },
+    tier: tier(now, newAnchor),
+  });
+  const a = new HarnessBudget({ filePath, logger });
+  a.record("web_search"); // rollover 清零旧计数 → 新周期 sp=1 → 落盘
+  const disk = readState();
+  assert.equal(disk.periodAnchor, newAnchor);
+  // 若合并语义是「无脑取较大值」，旧周期 90 会被带进新周期（91）→ 错乱。
+  assert.equal(disk.byEquity.search_pro, 1);
+});
+
+test("A4 同周期官网快照：整体取 equitiesFetchedAt 较新的一份", (t) => {
+  const { filePath, logger, writeState, readState } = setup(t);
+  const now = Date.now();
+  writeState({
+    periodAnchor: now + 20 * DAY_MS,
+    totalCalls: 0,
+    byEquity: {},
+    tier: tier(now),
+    equities: [{ key: "search_pro", unit: "次", available: 50, total: 100 }],
+    equitiesFetchedAt: now - 60_000,
+    equityUsedAtFetch: {},
+  });
+  const a = new HarnessBudget({ filePath, logger });
+  const b = new HarnessBudget({ filePath, logger });
+  // b 拉到更新的官网余额（40）；a 拉取失败保留旧快照（50）。
+  b.setEquities([{ key: "search_pro", unit: "次", available: 40, total: 100 }]);
+  a.setEquities(null);
+  const disk = readState();
+  assert.equal(disk.equities[0].available, 40, "旧快照不得盖掉磁盘上更新的快照");
+  assert.ok(disk.equitiesFetchedAt >= now);
+  // 快照三件套（equities/fetchedAt/usedAtFetch）必须整体取同一份，
+  // 合并后本实例内存也应采纳磁盘的较新快照。
+  const s = a.equityState("search_pro");
+  assert.equal(s.source, "official");
+  assert.equal(s.remaining, 40);
+});
+
+test("A5 落盘时磁盘损坏：.bak 恢复 + .corrupt 隔离 + warning，绝不静默归零", (t) => {
+  const { filePath, logger, warns, writeState, readState } = setup(t);
+  const a = new HarnessBudget({ filePath, logger });
+  a.recordRequest();
+  a.recordRequest(); // 磁盘 totalCalls=2，.bak=1（上一份好文件）
+  fs.writeFileSync(filePath, "{broken json");
+  a.recordRequest(); // 内存 3；磁盘现值读坏 → 必须走恢复路径而不是当成 0
+  // 本实例内存保有完整历史（3），.bak 只有 1：合并绝不能把计数归零或丢掉本实例历史。
+  assert.equal(readState().totalCalls, 3);
+  assert.ok(
+    warns.some((w) => w.includes("损坏") || w.includes("备份")),
+    "坏读必须明确 warning，不能静默",
+  );
+  assert.ok(
+    fs.readdirSync(path.dirname(filePath)).some((f) => f.startsWith("budget.json.corrupt-")),
+    "坏文件应挪成 .corrupt-<ts> 留证",
+  );
+  // 第二段：.bak 里含有别的实例写入的更高计数（6），主文件损坏。
+  // 合并必须从 .bak 恢复并叠加本实例增量（6+1=7），而不是静默当成 0 只写自己的 4。
+  const anchor = readState().periodAnchor;
+  writeState({ periodAnchor: anchor, totalCalls: 7, byEquity: {} }); // 先让主文件有效
+  fs.writeFileSync(`${filePath}.bak`, JSON.stringify({ periodAnchor: anchor, totalCalls: 6, byEquity: {} }));
+  fs.writeFileSync(filePath, "{broken again");
+  a.recordRequest(); // 内存 4，增量 1
+  assert.equal(readState().totalCalls, 7, "磁盘坏读必须走 .bak 恢复，绝不能当成 0");
+});
+
+test("A6 双方都是估算锚点（无网关 resetTime）且相差几秒：视为同周期，增量合并", (t) => {
+  const { filePath, logger, writeState, readState } = setup(t);
+  const a = new HarnessBudget({ filePath, logger });
+  a.record("web_search"); // 本实例 rollover 兜底锚点 = now+30d，sp=1
+  const disk0 = readState();
+  // 另一实例的兜底锚点晚 5 秒（构造时刻不同）：这不是真正的周期切换，
+  // 若按「锚点不同即取新周期」处理会把双方计数互吞。
+  writeState({
+    ...disk0,
+    periodAnchor: disk0.periodAnchor + 5000,
+    totalCalls: 6,
+    byEquity: { search_pro: 6 },
+  });
+  a.record("web_search"); // 本实例 sp=2，增量 1 → 合并后 6+1=7
+  const disk = readState();
+  assert.equal(disk.byEquity.search_pro, 7);
+  assert.equal(disk.totalCalls, 6);
+  assert.equal(disk.periodAnchor, disk0.periodAnchor + 5000);
+});
+
+// ---------------------------------------------------------------------------
+// 缺陷 B：时钟回拨
+// ---------------------------------------------------------------------------
+
+test("B1 时钟回拨：fetchedAt 在未来 → 官网快照不可信，退回 local", (t) => {
+  const { filePath, logger, writeState } = setup(t);
+  const now = Date.now();
+  // 等价于「快照拉取后本机时钟回拨 1 小时」：fetchedAt 落在未来。
+  writeState({
+    periodAnchor: now + 20 * DAY_MS,
+    totalCalls: 3,
+    byEquity: { search_pro: 3 },
+    tier: tier(now),
+    equities: [{ key: "search_pro", unit: "次", available: 80, total: 100 }],
+    equitiesFetchedAt: now + 3_600_000,
+    equityUsedAtFetch: { search_pro: 3 },
+  });
+  const a = new HarnessBudget({ filePath, logger });
+  const s = a.equityState("search_pro");
+  assert.equal(s.source, "local", "回拨后差值为负，快照必须判为不可信");
+  assert.equal(s.remaining, 97); // 本地口径：100 - 3
+  assert.equal(a.status().equitiesFresh, false, "status 的新鲜度判定同病同修");
+});
+
+test("B1-guard 正常时钟：新鲜度行为不变（护栏）", (t) => {
+  const { filePath, logger, writeState } = setup(t);
+  const now = Date.now();
+  const seed = (fetchedAt) => ({
+    periodAnchor: now + 20 * DAY_MS,
+    totalCalls: 3,
+    byEquity: { search_pro: 3 },
+    tier: tier(now),
+    equities: [{ key: "search_pro", unit: "次", available: 80, total: 100 }],
+    equitiesFetchedAt: fetchedAt,
+    equityUsedAtFetch: { search_pro: 3 },
+  });
+  // 1 分钟前拉取：新鲜，走 official。
+  writeState(seed(now - 60_000));
+  const fresh = new HarnessBudget({ filePath, logger });
+  assert.equal(fresh.equityState("search_pro").source, "official");
+  assert.equal(fresh.equityState("search_pro").remaining, 80);
+  assert.equal(fresh.status().equitiesFresh, true);
+  // 15 分钟内（留 30s 余量防执行耗时越过边界）：仍新鲜。
+  // 精确的 15min 边界不钉死：实现里两次 Date.now() 相隔几 ms 就会让
+  // 「恰好 15min」在 <= 与 > 之间漂移，那是正常时钟下的既有行为，不属于本修复。
+  writeState(seed(now - 15 * 60_000 + 30_000));
+  const near = new HarnessBudget({ filePath, logger });
+  assert.equal(near.equityState("search_pro").source, "official");
+  // 明显超过 15 分钟：过期，退回 local。
+  writeState(seed(now - 16 * 60_000));
+  const stale = new HarnessBudget({ filePath, logger });
+  assert.equal(stale.equityState("search_pro").source, "local");
+  assert.equal(stale.status().equitiesFresh, false);
+});
+
+test("B2 时钟回拨：suppressedNotifiedAt 在未来 → 每小时提示不被无限抑制", (t) => {
+  const { filePath, logger, infos, writeState } = setup(t);
+  const now = Date.now();
+  writeState({
+    periodAnchor: now + 20 * DAY_MS,
+    totalCalls: 0,
+    byEquity: {},
+    tier: tier(now),
+    suppressedNotifiedAt: now + 3_600_000, // 回拨后落在未来
+  });
+  const a = new HarnessBudget({ filePath, logger });
+  a.noteSuppression({
+    dropped: [{ key: "search_pro", used: 100, quota: 100, source: "local" }],
+    until: now + 20 * DAY_MS,
+  });
+  // 差值为负应视为「已过 1 小时」：宁可多提示，不能无限吞掉耗尽警告。
+  assert.equal(infos.length, 1);
+});
+
+test("B2-guard 正常时钟：1 小时内不重复提示（护栏）", (t) => {
+  const { filePath, logger, infos, writeState } = setup(t);
+  const now = Date.now();
+  writeState({
+    periodAnchor: now + 20 * DAY_MS,
+    totalCalls: 0,
+    byEquity: {},
+    tier: tier(now),
+    suppressedNotifiedAt: now - 1000, // 刚提示过
+  });
+  const a = new HarnessBudget({ filePath, logger });
+  a.noteSuppression({ dropped: [], until: now + 20 * DAY_MS });
+  assert.equal(infos.length, 0);
+});

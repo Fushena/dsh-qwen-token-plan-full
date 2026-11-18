@@ -159,3 +159,100 @@ test('missing route or baseURL degrades to a recorded error, never throws', asyn
     restore();
   }
 });
+
+/**
+ * 规格回填回归（v0.4.2）：修复前被降级档案喂进 pi-ai 的条目，探完后必须能回填。
+ * 为什么需要：seen.has(id) 让旧 id 永远不进 fresh，reprobe 只修好本插件目录，
+ * 用户实际用的 pi-ai 线路会一直停在降级规格（跨重启也不重补）。
+ * 同时必须守住「只追加」承诺：用户手工改过的条目一律不碰。
+ */
+function repairHarness({ specs, models }) {
+  const edits = [];
+  const entry = {
+    options: {
+      id: 'llm-pi-ai',
+      config: { providers: { qwentokenplan: { apiKeyEnv: 'QTPF_TEST_FEED_KEY', baseURL: 'https://gw.example/v1', models } } },
+    },
+  };
+  const editor = {
+    entries: () => [entry],
+    edit: async (target, change) => {
+      const next = change(structuredClone(target.options.config), {});
+      target.options.config = next;
+      edits.push(next);
+    },
+  };
+  const ctx = { get: (n) => (n === 'configEditor' ? editor : undefined), logger: { info() {}, warn() {}, debug() {} } };
+  const catalog = { find: (id) => specs[id] };
+  const fetchImpl = async () => ({ ok: true, json: async () => ({ data: [{ id: 'probe-x' }] }) });
+  const make = () => new CatalogFeed({ ctx, catalog, feedProvider: 'qwentokenplan', pluginName: 'test', fetchImpl });
+  return { entry, edits, make };
+}
+
+test('feed repairs a previously-fed entry once its spec is fully probed', async () => {
+  const { restore } = isolateHome('qtpf-feed-repair-');
+  const prevKey = process.env.QTPF_TEST_FEED_KEY;
+  process.env.QTPF_TEST_FEED_KEY = 'sk-test';
+  try {
+    // 第一轮：目录档案是保守推断值（探测被打断），补进 pi-ai。
+    const specs = { 'probe-x': { reasoning: true, reasoningEfforts: ['none', 'low', 'medium', 'xhigh'], contextWindow: 1000000, maxTokens: 65536, input: ['text'], capabilities: '动态发现（规格为保守推断值）' } };
+    const { entry, make } = repairHarness({ specs, models: [] });
+    const first = make();
+    const r1 = await first.run();
+    assert.deepEqual(r1.added, ['probe-x']);
+    assert.equal(entry.options.config.providers.qwentokenplan.models[0].maxTokens, 65536);
+
+    // 第二轮：网络恢复、探测完整。新实例（模拟重启后读回 seen/fed）。
+    specs['probe-x'] = { ...specs['probe-x'], maxTokens: 393216, input: ['text', 'image'], capabilities: '动态发现（能力已探测）' };
+    const r2 = await make().run();
+    assert.deepEqual(r2.added, [], 'seen 记得它，不该再当新模型追加');
+    assert.deepEqual(r2.repaired, ['probe-x'], '但规格探完了必须回填');
+    const fixed = entry.options.config.providers.qwentokenplan.models[0];
+    assert.equal(fixed.maxTokens, 393216, '降级值必须被真值覆盖');
+    assert.deepEqual(fixed.input, ['text', 'image']);
+
+    // 第三轮：规格没再变 → 不该白开 HMR 事务。
+    const r3 = await make().run();
+    assert.deepEqual(r3.repaired, [], '规格未变不得重复回填');
+  } finally {
+    if (prevKey === undefined) delete process.env.QTPF_TEST_FEED_KEY; else process.env.QTPF_TEST_FEED_KEY = prevKey;
+    restore();
+  }
+});
+
+test('feed never overwrites an entry the user edited by hand', async () => {
+  const { restore } = isolateHome('qtpf-feed-manual-');
+  const prevKey = process.env.QTPF_TEST_FEED_KEY;
+  process.env.QTPF_TEST_FEED_KEY = 'sk-test';
+  try {
+    const specs = { 'probe-x': { reasoning: true, reasoningEfforts: ['none', 'low', 'medium', 'xhigh'], contextWindow: 1000000, maxTokens: 65536, input: ['text'], capabilities: '动态发现（规格为保守推断值）' } };
+    const { entry, make } = repairHarness({ specs, models: [] });
+    await make().run();
+    // 用户手工把上限调成自己想要的值。
+    entry.options.config.providers.qwentokenplan.models[0].maxTokens = 8192;
+    specs['probe-x'] = { ...specs['probe-x'], maxTokens: 393216, capabilities: '动态发现（能力已探测）' };
+    const r = await make().run();
+    assert.deepEqual(r.repaired, [], '指纹对不上 = 人改过，一律不动');
+    assert.equal(entry.options.config.providers.qwentokenplan.models[0].maxTokens, 8192, '人的改动优先');
+  } finally {
+    if (prevKey === undefined) delete process.env.QTPF_TEST_FEED_KEY; else process.env.QTPF_TEST_FEED_KEY = prevKey;
+    restore();
+  }
+});
+
+test('feed leaves entries it never wrote alone (no fingerprint recorded)', async () => {
+  const { restore } = isolateHome('qtpf-feed-legacy-');
+  const prevKey = process.env.QTPF_TEST_FEED_KEY;
+  process.env.QTPF_TEST_FEED_KEY = 'sk-test';
+  try {
+    // 旧版本补的条目：state 里没有 fed 指纹 → 保守，不碰。
+    const specs = { 'probe-x': { reasoning: true, reasoningEfforts: ['none', 'low'], contextWindow: 1000000, maxTokens: 393216, input: ['text', 'image'], capabilities: '动态发现（能力已探测）' } };
+    const { entry, make } = repairHarness({ specs, models: [{ id: 'probe-x', name: 'legacy', maxTokens: 4096 }] });
+    const r = await make().run();
+    assert.deepEqual(r.repaired, []);
+    assert.equal(entry.options.config.providers.qwentokenplan.models[0].maxTokens, 4096);
+  } finally {
+    if (prevKey === undefined) delete process.env.QTPF_TEST_FEED_KEY; else process.env.QTPF_TEST_FEED_KEY = prevKey;
+    restore();
+  }
+});

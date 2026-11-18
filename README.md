@@ -151,12 +151,24 @@ edit 在 HTTP 处理器的干净异步上下文执行）。原因：HMR 事务�
 | `us-east-1` | 401 `InvalidApiKey` |
 
 所以海外用户只能跨境回北京（或改用国际站账号 + 新加坡 key），改地域不是加速手段。
-`endpoint: auto`（默认）会在启动时并发探测这两个站点的 `/models`，谁返回 200 用谁并锁定；
+`endpoint: auto`（默认）会在启动时并发探测这两个站点的 `/models`，**按完成顺序取结果**：
+国内站先 200 就立即采用（国际站黑洞也不拖慢）；国际站先 200 时再给国内站 1.5s 宽限，
+它在这期间也 200 就仍按国内站优先，否则采用国际站。
 两个都不通（断网/无 key）时保留国内站默认值，**provider 照常注册不失活**。
+
+为什么要按完成顺序而不是等两边都落定（v0.4.2 修复）：国内站被黑洞丢包时，等全落定要白等满
+15s 探测预算，而这 15s 直接压在用户第一个请求上（实测 15003ms → 现在 1502ms）。
+注意「先 `await` 国内站、失败再看国际站」是**同一个坑的另一半**——慢的那个仍然挡在前面，
+实测同样 15003ms。1.5s 宽限则是为了不把「国内站只是慢了几百毫秒」误判成国际站（key 不匹配 → 401）。
 命中后对话、Chat、目录、图片/视频工具的 URL **整套一起换**，不会出现半切换。
-判定挡在第一个模型请求之前（只探一次，实测 763ms），因为跨站点 401 不在可重试码里，
+判定挡在第一个模型请求之前（实测 763ms），因为跨站点 401 不在可重试码里，
 漏一轮就是整轮直接失败。**观察-only（`registerProvider: false`）时聊天不经过本插件**，
 所以图片/视频工具在 `execute` 入口也等判定落地——否则生图会是第一个打到旧地域的请求。
+
+**只有判定成功才固化**（v0.4.2 修复）。v0.4.1 把失败结果一起缓存：启动那一瞬间恰好断网，
+国际站 key 就被永久钉在国内站，之后每轮都是不可重试的 `AUTH 401`，网络恢复也不自愈，
+只能重启进程（2026-11-18 实测：恢复后重探次数 0）。现在失败会留下重试机会，冷却 30s；
+冷却期内的请求直接放行，不拿探测预算压住用户这一轮。
 面板 `GET /qwen-token-plan-full/status` 的 `provider.site` / `siteReason`
 会显示判定结果，`provider.endpoint` / `requestTimeoutMs` 显示当前生效值。
 
@@ -173,6 +185,14 @@ edit 在 HTTP 处理器的干净异步上下文执行）。原因：HMR 事务�
 **断连的机制**：跨境链路的中间 NAT / 代理节点空闲回收更激进，长时间没有字节的流会被静默掐断。
 空闲超时触发后报 `TIMEOUT`，宿主 `llm-retry` 会重试——**最坏墙钟 = `requestTimeoutMs` × (1 + `maxRetries`)**。
 默认 120s × 3 = 360s。两个旋钮要成对调：只把超时拉到 300s 而留着 5 次重试，最坏就是 30 分钟假死。
+
+**另一条断连来源：流内错误曾被一律当成 400**（v0.4.2 修复）。上游的限流、过载、超时常常
+不在 HTTP 头里，而是 HTTP 200 之后在 SSE 流里下发 `{"type":"error","error":{"code":...}}`。
+v0.4.1 把这类错误写死成 400 → 归类 `PROVIDER_ERROR`，而它**不在** `DEFAULT_RETRYABLE_CODES`
+（`EMPTY_RESPONSE`/`RATE_LIMIT`/`SERVER`/`TIMEOUT`/`TRANSPORT`）里 → `llm-retry` 一次都不重试，
+用户看到的就是"用着突然断连"。现在流内错误码先还原成等价 HTTP 状态，再走与 HTTP 错误
+**同一份**词表：限流→`RATE_LIMIT`、过载/内部错误→`SERVER`、超时→`TIMEOUT`（均可重试）；
+额度耗尽仍是 `QUOTA`、认证失败仍是 `AUTH`、用户取消仍是 `ABORTED`（都不可重试）。
 
 排查顺序：① 看面板 `provider.site` 是否是预期站点（401 多半是 key 与站点不匹配）；
 ② `proxy` 是否真的生效（**socks 不支持**，会静默回退直连；Node 也不读系统代理，见下节）；
@@ -250,7 +270,7 @@ Esc 也可关闭。数据同源口径：套餐剩余 = 网关 `per1MonthPercenta
 
 ### 本地验证
 
-在插件目录执行 `npm test`（90 项：compat + relogin + stream + tier-retry + route-guard + model-display + catalog-feed + observer + capability-probe + config-knobs，含媒体下载 SSRF/重定向回归）。runner 逐文件串行执行（Windows 上唯一全绿的组合，见 `test/run.mjs` 注释）。
+在插件目录执行 `npm test`（159 项：compat + relogin + stream + tier-retry + route-guard + model-display + catalog-feed + observer + capability-probe + config-knobs + stream-resilience + probe-integrity + media-safety + budget-merge，含媒体下载 SSRF/重定向、流内错误分类、探测完整性、跨实例预算合并回归）。runner 逐文件串行执行（Windows 上唯一全绿的组合，见 `test/run.mjs` 注释）。另有 `test/client-smoke.mjs` 单独跑（面板渲染桩，不在 runner 内）。
 `test/config-knobs.test.js` 钉死两个跨境旋钮与站点自动判定：默认值与最坏墙钟、非法值拒绝、
 `providerRetryPolicy` 真的把策略交给宿主、真实 HTTP 服务器上卡死的流在**配置的**阈值处报 TIMEOUT、
 国际站 key 自动切新加坡、断网不失活、换站点后媒体工具与目录一起跟随、
@@ -262,6 +282,70 @@ Esc 也可关闭。数据同源口径：套餐剩余 = 网关 `per1MonthPercenta
 测试使用本机已安装的 DeepSeek Harness 内置运行时与真实 `dsh-llm` 类，不访问网络、不读取个人凭据。其他安装路径可通过 `DSH_TEST_NODE` 和 `DSH_TEST_RUNTIME` 指定。
 
 真实联网验证需单独进行；正常测试不会运行图片或视频生成。
+
+## v0.4.2（2026-11-18，发布后审计整改）
+
+对已发布的 v0.4.1 做了一轮完整审计（三路并行只读审计 + 逐条实测复核），发现 18 个问题并全部修复。
+审计报告见工作区 `qwen-plugin-audit-0.4.1.md`。四个 P0：
+
+1. **流内错误一律当 400 → 跨境断连不重试**（见「不同地区访问」节）。修复后限流/过载/超时
+   分别归 `RATE_LIMIT`/`SERVER`/`TIMEOUT`，`llm-retry` 才会介入。分类**先信结构化 code、
+   再回落 message 文本**：宿主的额度判定只看文本里有没有 `quota exceeded`，
+   `code=rate_limit_exceeded` 而文案带 quota 字样的限流会被误判成不可重试的 `QUOTA`。
+2. **站点判定失败被永久固化**（见「不同地区访问」节）。改为只有真拿到 200 才固化，
+   失败留 30s 冷却后重试；面板手动刷新绕过冷却（用户点刷新就是要立刻重试）。
+3. **能力探测被 30s 目录预算掐断，降级值还被永久缓存**。线上实测同一个
+   `qwen4-max-preview`：30s 只发出 10 个请求 → `maxTokens` 探成 131072；180s 发满 11 个
+   → 393216（真值）。被掐位置随网络抖动而变，多次运行得到 131072/262144/393216 三种结果。
+   现在探测有独立预算，不可信失败（传输错误/中止/5xx）不写缓存、改走保守推断并留
+   `probe-incomplete` 痕迹，面板刷新可 `reprobe` 重探。
+4. **`referenceImage` 可外发任意本地文件**：此前不校验扩展名/内容/目录，一个 `.env`
+   就能被 base64 原样发给上游。现在扩展名白名单 + 魔数校验 + 先 `stat` 判大小 +
+   `realpath` 收口在会话工作目录内。
+
+另有 5 个 P1（SSE 单事件无上限、`excludeModels` 不排除探测、`refresh` 无串行化、
+探测等整段生成读完、下载全量驻留内存）与 9 个 P2（SSRF 缺网段与非字面量域名、
+参考图先读后判大小、非对话模型过滤漏项、面板刷新绕过站点门控、站点探测等全落定、
+预算跨实例整份覆写、时钟回拨快照永不过期、配置项缺说明、两处代码/注释冗余）。
+
+**修复过程中又自查出五处新问题，一并修掉**（前三处是修复本身引入的，后两处是审计漏掉的）：
+
+- **★ 探测用的图片本身不合格，导致所有动态发现的模型都被判成「不能收图」**。
+  `PROBE_PNG_BASE64` 注释写「16×16」，实际是 **1×1**。上游对图片有最小边长限制，
+  实测 `qwen4-max` 与 `qwen4-max-preview` 都回 HTTP 200 + `response.failed`：
+  `InvalidParameter: The image length and width do not meet the model restrictions.
+  [height:1 or width:1 must be larger than 10]`。这属于「可信的拒绝」，于是被当成能力事实
+  缓存下来 —— 每个新模型一律 `input: ["text"]`，带图请求在宿主装配阶段抛 `UNSUPPORTED_CONTENT`。
+  **动态能力探测本想根治的毛病，被探测自己用一张不合格的图重新造了出来。**
+  换成真正 16×16 后，同一请求返回 `response.created`，线上复测
+  `qwen4-max-preview` 得到 `input: ["text","image"]`、`maxTokens: 393216`，连续两轮稳定一致。
+
+- **面板刷新会被能力探测拖死**。探测预算 180s，而面板前端 fetch 上限 45s，
+  用户会先看到超时报错、后台还在继续花 Credits。现在前台刷新最多等 8s
+  （`FOREGROUND_REFRESH_WAIT_MS`）就先回状态，探测转后台继续**不取消**（已在跑的探测
+  取消掉等于白花钱），面板显示「模型规格探测中…」。
+- **无条件 `reprobe` 会每次开面板重打 11 次付费生成**。点徽标就走 `POST /refresh`，
+  所以只有上次探测留了 `probe-incomplete` 痕迹才重探，否则命中缓存。
+- **`reprobe` 修好了本插件目录，却修不到用户真正在用的 pi-ai 条目**。补货器把模型 id
+  记进 `seen` 后就不再重写，降级规格会一直留在 pi-ai 线路里、跨重启也不恢复。现在补货器
+  记录自己写入时的**规格指纹**，下次发现该模型已探完且现存条目仍与指纹一致，就定向回填
+  `contextWindow`/`maxTokens`/`input`/`reasoningEfforts`。三重闸门保证不误伤：目录里必须是
+  已探测档案、必须有本器留下的指纹、指纹必须仍对得上（**用户手工改过就一律不碰**）。
+- **补货状态首次写盘必失败**。`~/.dsh` 不存在时直接 `writeFileSync` 报错，只留一条 warn，
+  于是「补过哪些模型」跨重启失忆。已补 `mkdirSync(recursive)`。
+
+测试从 90 项扩到 **159 项离线回归全部通过**（新增 `stream-resilience` 17、`probe-integrity` 16、
+`media-safety` 22、`budget-merge` 11，`catalog-feed` 5→8）。每条修复都做过 mutation 验证：
+把修复改回旧写法，对应用例必须失败。测试卫生也一并收口：视频用例原先把产物写死到 `/tmp`
+（实测累积 126 个残片），改为独立临时目录 + `finally` 清理。
+
+**已知残留风险（写明不假装解决）**：预算合并是 read-merge-write，无文件锁（Node 无内置 flock），
+两个进程在同一毫秒级窗口同时读到旧值仍可能丢一次增量——比旧实现「整份吞掉」已大幅收窄
+（每次调用即落盘，窗口极小），彻底消除需要锁文件或单写者架构。媒体下载走代理时，本地 DNS 私网校验只是 best-effort
+（`ProxyAgent` 把主机名交代理侧解析）；DNS rebinding 的 TOCTOU 窗口仍在——校验与建连是两次
+独立解析。彻底封堵要把校验过的 IP 钉进连接（自定义 undici dispatcher 的 `connect.lookup`），
+那会破坏代理转发与 SNI/证书校验，代价大于收益。当前把利用门槛抬到「需控制目标域名的权威 DNS
+且赢两次解析竞态」，且 URL 来自上游响应而非任意网页。
 
 v0.4.1（2026-11-17，跨境稳定性 × 观察模式合流）在 v0.4.0 的旁路观察/目录补货之上合入：
 `requestTimeoutMs` 与 `retryPolicy` 两个配置旋钮（此前写死 60s + 宿主默认 5 次重试，用户无法调）、

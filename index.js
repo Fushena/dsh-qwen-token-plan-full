@@ -27,8 +27,8 @@ export const Config = z.object({
   apiKeyEnv: z.string().role("credential-ref").default("QWEN_TOKEN_PLAN_CN_API_KEY"),
   // "auto"：启动时并发探测国内站/国际站的 /models，谁 200 用谁（key 与地域绑定，
   // 跨地域一律 401，见 lib/site.js）。显式写死一个 URL 则完全跳过探测。
-  endpoint: z.string().default("auto"),
-  chatEndpoint: z.string(),
+  endpoint: z.string().default("auto").description("Responses 端点。留空或 auto = 启动时自动判定国内站/国际站（两站点 key 不通用，跨站一律 401）；也可显式写死 URL。"),
+  chatEndpoint: z.string().description("Chat Completions 端点。留空则由 endpoint 自动派生（/responses → /chat/completions）。"),
   harness: z.any().default("auto"),
   mediaTools: z.boolean().default(true),
   models: z.array(z.any()).default([]),
@@ -51,7 +51,7 @@ export const Config = z.object({
   // 空闲超时（不是总时长）：多久没有新字节算卡死。跨境静默窗口比国内长得多
   // （中间 NAT / 机场节点的空闲回收更激进），60s 会把健康请求误杀，故默认 120s。
   // 必须与 retryPolicy 成对调：最坏墙钟 = requestTimeoutMs × (1 + maxRetries)。
-  requestTimeoutMs: z.number().min(1_000).default(120_000),
+  requestTimeoutMs: z.number().min(1_000).default(120_000).description("空闲超时（毫秒，不是总时长）：多久没有新字节算卡死。跨境静默窗口比国内长，60s 会误杀健康请求，故默认 120000。与重试次数成对调：最坏墙钟 = 本值 ×(1 + maxRetries)。"),
   // 请求重试策略（DSH 的 llm-retry 在 provider 配置下读取，见 dsh-llm 的 RetryPolicySchema）。
   // 跨境每次重试都要重新全量上传整段历史，DSH 默认的 5 次会把一次抖动放大成分钟级假死，
   // 所以这里默认降到 2 次、退避起点抬到 1000ms。
@@ -59,18 +59,18 @@ export const Config = z.object({
     mode: "normal",
     maxRetries: 2,
     backoff: { initialDelayMs: 1_000, maxDelayMs: 10_000, jitterRatio: 0.1 },
-  }),
+  }).description("请求重试策略（交给宿主 llm-retry 执行）。跨境每次重试都要重传整段历史，DSH 默认 5 次会把一次抖动放大成分钟级假死，故默认 2 次、退避起点 1000ms。"),
   // false = 观察-only：不注册 adapter/provider（模型从选择器消失），面板/计数/媒体工具照常。
   // 聊天走手工 provider 时改插件不再中断请求；需要服务端内置工具时保持 true 并手动选本插件模型。
-  registerProvider: z.boolean().default(true),
+  registerProvider: z.boolean().default(true).description("是否注册模型 provider。false = 观察-only：模型从选择器消失，但面板计数、权益工具、目录补货照常工作（聊天走手工线路时改插件不再中断请求）。"),
   // 旁路观察名单：这些 provider 的模型调用也计入面板「本周期调用次数」（本插件 providerId 始终在内）。
-  watchedProviders: z.array(z.string()).default(["qwentokenplan"]),
+  watchedProviders: z.array(z.string()).default(["qwentokenplan"]).description("旁路观察名单：这些 provider 的模型调用也计入面板「本周期调用次数」。本插件自身始终在内，无需重复填写。"),
   // 目录补货：定期从普通线路（pi-ai 手工 provider）自己的域名抓 /models，
   // 把新对话模型追加进它的 models 配置（只追加、真变化才写、免重启生效）。
-  catalogFeed: z.boolean().default(true),
-  feedProvider: z.string().default("qwentokenplan"),
+  catalogFeed: z.boolean().default(true).description("目录补货：定期从普通线路自己的域名抓 /models，把新对话模型追加进它的 models 配置（只追加、真变化才写、免重启生效）。"),
+  feedProvider: z.string().default("qwentokenplan").description("补货目标：新模型追加到哪个手工 provider 的 models 里。"),
   // 补货时是否翻译推理档位（reasoningEfforts + compat.thinkingFormat）；false 只补 id/name/容量/模态。
-  feedReasoning: z.boolean().default(true),
+  feedReasoning: z.boolean().default(true).description("补货时是否翻译推理档位。false 则只补 id/名称/容量/模态，档位吃目标线路的默认值。"),
 });
 
 /** tierRefreshHours 宿主侧兜底缺省值，与 Config 默认保持一致。 */
@@ -170,6 +170,15 @@ export function apply(ctx, config = {}) {
   let stopped = false;
   const lifetime = new AbortController();
   const refreshSignal = () => AbortSignal.any([lifetime.signal, AbortSignal.timeout(30_000)]);
+  // 能力探测要独立预算：每个新模型 11 次串行真实生成请求，30s 的目录刷新预算装不下。
+  // 2026-11-18 线上实测同一个 qwen4-max-preview：30s → 只发出 10 个请求、maxTokens
+  // 探成 131072；180s → 11 个请求、393216（真值）。被掐的位置随网络抖动而变，
+  // 结果不稳定，且降级值会被缓存固化。/models 本身仍用 30s（那只是一个 GET）。
+  const PROBE_BUDGET_MS = 180_000;
+  const probeSignal = () => AbortSignal.any([lifetime.signal, AbortSignal.timeout(PROBE_BUDGET_MS)]);
+  // 面板点刷新时最多同步等这么久，之后先回旧快照、探测转后台。必须显著小于前端的
+  // REFRESH_TIMEOUT_MS（45s，lib/client.js），否则用户等到的是前端超时报错而不是状态。
+  const FOREGROUND_REFRESH_WAIT_MS = 8_000;
 
   // 等级信息：立即取一次，之后按 tierRefreshHours（默认 1 小时）周期刷新；
   // 控制台 Cookie 缺失或网关失败时用 config.tier/内置表兜底（standard），预算机制不失效。
@@ -256,10 +265,27 @@ export function apply(ctx, config = {}) {
 
   const makeTimer = (fn, ms) => (typeof ctx.interval === "function" ? ctx.interval(fn, ms) : setInterval(fn, ms));
   const clearTimer = (t) => { try { if (typeof t === "function") t(); else { clearInterval(t); clearTimeout(t); } } catch { /* best effort */ } };
-  const refreshCatalog = () => catalog.refresh(refreshSignal()).then((updated) => {
-    if (updated && !stopped) ctx.llm.emitAdaptersUpdated();
-    return updated;
-  });
+  // options.reprobe=true 用于「上次被掐断」的恢复：清掉探测缓存重探。
+  // options.foreground=true 用于面板手动刷新（HTTP 请求）：此时**不等**能力探测。
+  // 为什么必须分开：面板 fetch 有 45s 上限（lib/client.js REFRESH_TIMEOUT_MS），而探测
+  // 预算是 180s；让用户的一个点击同步等最长 3 分钟的付费生成，只会等到前端超时报错、
+  // 后台却还在花钱。所以前台刷新只保证「目录 + 余额」立刻回来，探测转后台继续，
+  // 探完由 emitAdaptersUpdated 通知宿主，下一轮轮询自然看到新规格。
+  let probing = false;
+  const refreshCatalog = (options = {}) => {
+    const { foreground = false, ...rest } = options;
+    const task = catalog.refresh(refreshSignal(), { probeSignal: probeSignal(), ...rest }).then((updated) => {
+      if (updated && !stopped) ctx.llm.emitAdaptersUpdated();
+      return updated;
+    });
+    if (!foreground) return task;
+    // 目录部分（/models，30s 预算）与探测部分（180s）之间没有可观测的分界点，
+    // 所以前台只给 task 一个短观察窗：窗内完成就用真结果，否则先回旧快照。
+    // 任务本身**不取消**（探测已在跑，取消等于白花钱），只是不再让用户等它。
+    probing = true;
+    task.catch(() => {}).finally(() => { probing = false; });
+    return Promise.race([task, new Promise((r) => { const t = setTimeout(() => r(false), FOREGROUND_REFRESH_WAIT_MS); t.unref?.(); })]);
+  };
   // 目录刷新后顺带补货。关键坑（2026-11-17 实测）：HMR 事务用 AsyncLocalStorage 标记，
   // 异步链会继承——启动 tick 生在事务里，延后多久的定时器回调都仍带标记，直接调
   // configEditor.edit 必报 "HMR transactions cannot be nested"。而 HTTP 处理器跑在
@@ -297,6 +323,11 @@ export function apply(ctx, config = {}) {
         models: snapshot.models.length,
         catalogSource: snapshot.source,
         catalogSyncedAt: snapshot.syncedAt ?? null,
+        // 目录/探测的失败原因要能看见：探测被掐断时 source 仍是 "live"（目录确实拉到了），
+        // 只有 lastError 里的 probe-incomplete 痕迹能说明「规格是保守推断出来的」。
+        catalogError: catalog.lastError ?? null,
+        // 探测是否还在后台跑：面板据此显示「规格探测中」，而不是让用户以为卡住了。
+        probing,
         // 面板要能看出「这把 key 到底落在哪个站点」，否则跨境 401 时无从排查。
         endpoint: route.endpoint,
         site: siteState.site,
@@ -374,7 +405,7 @@ export function apply(ctx, config = {}) {
         signal: lifetime.signal, logger: ctx.logger,
       });
       if (stopped) return;
-      siteState = { site: result.site, reason: result.reason };
+      siteState = { site: result.site, reason: result.reason, probed: result.probed === true };
       if (result.endpoint === route.endpoint) return;
       // 就地改：media tools 捕获的是这个对象本身，换新对象它们就看不见。
       Object.assign(route, deriveRoute(result.endpoint), explicitChat ? { chatEndpoint: explicitChat } : {});
@@ -384,13 +415,37 @@ export function apply(ctx, config = {}) {
       ctx.llm.emitAdaptersUpdated();
     } catch (error) {
       if (stopped) return;
-      siteState = { site: "cn", reason: `判定异常：${error instanceof Error ? error.message : String(error)}` };
+      siteState = { site: "cn", reason: `判定异常：${error instanceof Error ? error.message : String(error)}`, probed: false };
       ctx.logger?.warn?.(`${name}: 站点自动判定异常，保留国内站端点（${siteState.reason}）`);
     }
   };
-  // 只探一次；后到的调用者等同一个结果，不重复打上游。
+  // 判定成功才固化；失败（断网/超时/两站点都不通）留 null 让下次重试。
+  //
+  // 为什么不能连失败一起缓存：siteTask ??= detectOnce() 会把「启动瞬间断网 → 回落 cn」
+  // 永久钉住。国际站 key 在国内站一律 401，而 AUTH 不在 DEFAULT_RETRYABLE_CODES 里，
+  // llm-retry 不救 → 网络恢复后每一轮仍然直接失败，只能重启进程。
+  // 2026-11-18 实测：启动期断网后连续三轮全是 AUTH 401，恢复后重探次数 0。
   let siteTask = null;
-  const resolveSite = () => { siteTask ??= detectOnce(); return siteTask; };
+  let siteResolved = false;
+  let siteRetryAfter = 0;
+  // 失败后的重试冷却：没有它，断网时每个请求都要先白等满 15s 探测预算
+  // （两个站点各一次），比原来的「只探一次」更慢。30s 与目录刷新同量级。
+  const SITE_RETRY_COOLDOWN_MS = 30_000;
+  const resolveSite = ({ force = false } = {}) => {
+    if (siteResolved || stopped) return Promise.resolve();
+    // 手动刷新要绕过冷却：用户点「刷新」正是想立刻重试，让他再等 30s 说不通。
+    // 但在途的仍复用同一个 Promise —— 并发点击不该重复打上游。
+    if (force) siteRetryAfter = 0;
+    else if (Date.now() < siteRetryAfter) return Promise.resolve();
+    siteTask ??= detectOnce().then(() => {
+      // detectOnce 内部已把成功/失败写进 siteState；只有拿到 200 才算判定完成。
+      if (siteState.probed) siteResolved = true;
+      else { siteTask = null; siteRetryAfter = Date.now() + SITE_RETRY_COOLDOWN_MS; }
+    }).catch(() => { siteTask = null; siteRetryAfter = Date.now() + SITE_RETRY_COOLDOWN_MS; });
+    return siteTask;
+  };
+  /** 供请求路径用：冷却期内 resolveSite 自己会直接放行，不拿探测预算压住用户这一轮。 */
+  const resolveSiteForRequest = () => resolveSite();
 
   // 判定必须挡在**第一个模型请求之前**：国际站 key 在国内站一律 401，而 401 不在
   // 可重试码里（DEFAULT_RETRYABLE_CODES），漏一轮就是整轮直接失败、llm-retry 也不救。
@@ -398,7 +453,7 @@ export function apply(ctx, config = {}) {
   if (autoEndpoint) {
     const originalStream = adapter.stream.bind(adapter);
     adapter.stream = async function* gatedStream(options) {
-      await resolveSite();
+      await resolveSiteForRequest();
       yield* originalStream(options);
     };
   }
@@ -412,7 +467,7 @@ export function apply(ctx, config = {}) {
       const disposeTools = registerMediaTools(ctx, {
         apiKeyEnv, pluginName: name, route,
         // 媒体工具自己发请求，绕过 adapter.stream 的门控；观察-only 时更是唯一出口。
-        awaitSite: autoEndpoint ? resolveSite : undefined,
+        awaitSite: autoEndpoint ? resolveSiteForRequest : undefined,
         imageModels, videoModels,
         defaultImageModel: String(config.defaultImageModel || imageModels[0]),
         defaultVideoModel: String(config.defaultVideoModel || videoModels[0]),
@@ -445,7 +500,14 @@ export function apply(ctx, config = {}) {
             return json(res, 200, statusPayload());
           }
           if (req.method === "POST" && sub === "refresh") {
-            await Promise.allSettled([refreshTier(), refreshCatalog(), refreshEquities(), ...(feed ? [feed.run()] : [])]);
+            // 必须先等站点判定：判定窗口（≤15s）内点面板刷新会拿旧端点打 /models，
+            // 国际站 key 在国内站 401 → 面板显示 lastError。
+            if (autoEndpoint) await resolveSite({ force: true });
+            // 只有上次探测没探完（lastError 留了 probe-incomplete 痕迹）才重探。
+            // 点徽标就会走这条路由，无条件 reprobe 等于每开一次面板就对每个新模型
+            // 重打 11 次**真实生成**请求 —— 那是花用户的 Credits 买同一个答案。
+            const incomplete = String(catalog.lastError ?? "").includes("probe-incomplete");
+            await Promise.allSettled([refreshTier(), refreshCatalog({ reprobe: incomplete, foreground: true }), refreshEquities(), ...(feed ? [feed.run()] : [])]);
             return json(res, 200, statusPayload());
           }
           // 补货触发端点：定时端经回环 POST 到这里，edit 跑在 HTTP 的干净异步上下文，
