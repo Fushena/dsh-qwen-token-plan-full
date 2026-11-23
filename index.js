@@ -11,6 +11,7 @@ import { ReloginFlow } from "./lib/relogin.js";
 import { createProxyFetch, redactProxyUrl } from "./lib/proxy.js";
 import { trustedRouteRequest } from "./lib/route-guard.js";
 import { SITE_ENDPOINTS, deriveRoute, isAutoEndpoint, detectSite } from "./lib/site.js";
+import { registerEquityMcp, equityChannel, MCP_HOSTS } from "./lib/mcp-equity.js";
 
 const DEFAULT_ENDPOINT = SITE_ENDPOINTS.cn;
 const DEFAULT_IMAGE_MODELS = ["qwen-image-3.0-pro", "wan2.7-image", "wan2.7-image-pro"];
@@ -31,6 +32,16 @@ export const Config = z.object({
   chatEndpoint: z.string().description("Chat Completions 端点。留空则由 endpoint 自动派生（/responses → /chat/completions）。"),
   harness: z.any().default("auto"),
   mediaTools: z.boolean().default(true),
+  // Harness 权益 MCP 通道（2026-11-23）：Token Plan 专属 Key（sk-sp-）只抵扣 Credits，
+  // 官方明确「不用于 Harness 服务」。要真正消耗套餐单列的 7 项权益，必须用百炼
+  // 按量付费 Key（sk- / sk-ws-）调 MCP。这里配的就是那把 Key 的凭据名。
+  bailianApiKeyEnv: z.string().role("credential-ref").default("BAILIAN_PAYG_API_KEY")
+    .description("百炼按量付费 Key（sk- / sk-ws-）的凭据名。配好后 7 项权益走 MCP：扣权益额度、不花 Credits；没配则一切照旧走模型 API 扣 Credits。"),
+  // auto = 有 Key 就挂全部权益服务；off = 完全不挂；也可显式列服务名（逗号分隔）。
+  mcpEquity: z.any().default("auto")
+    .description("权益 MCP 通道：auto（有 Key 就挂）/ off（不挂）/ 显式服务名列表，如 ImageGeneration,WebSearch。"),
+  mcpHost: z.string().default(MCP_HOSTS.cn)
+    .description("MCP 服务基址。默认千问 AI 平台 One Key；百炼 DashScope 用 https://dashscope.aliyuncs.com。"),
   models: z.array(z.any()).default([]),
   excludeModels: z.array(z.string()).default([]),
   imageModels: z.array(z.string()),
@@ -142,6 +153,16 @@ export function apply(ctx, config = {}) {
   // 服务端权益调用预算：上限按 Token Plan 等级自动推导（网关 quota-config ÷ perCallCredits）。
   const budget = new HarnessBudget({ config, logger: ctx.logger });
 
+  // Harness 权益 MCP 通道：有百炼按量付费 Key 才挂（没 Key 挂了也是 401）。
+  // 挂上后该能力从服务端内置工具手里接管过来 —— 内置工具走模型 API 只扣 Credits，
+  // MCP 才真正消耗套餐单列的权益额度。额度耗尽自动摘除、内置工具回来（用户选定策略）。
+  const mcp = registerEquityMcp(ctx, {
+    apiKeyEnv: String(config.bailianApiKeyEnv || "BAILIAN_PAYG_API_KEY"),
+    host: String(config.mcpHost || MCP_HOSTS.cn),
+    mode: config.mcpEquity,
+    budget, logger: ctx.logger, pluginName: name,
+  });
+
   // 目录补货器：聊天固定走普通线路时，新模型由这里补进普通线路的名单（见 lib/catalog-feed.js）。
   const feed = config.catalogFeed === false ? null : new CatalogFeed({
     ctx, catalog, feedProvider: String(config.feedProvider || "qwentokenplan"),
@@ -152,7 +173,7 @@ export function apply(ctx, config = {}) {
   const adapter = new QwenTokenPlanAdapter({
     ctx, catalog, providerId, displayName, apiKeyEnv,
     endpoint: route.endpoint, chatEndpoint: route.chatEndpoint, harnessMode,
-    pluginName: name, budget, fetchImpl: proxyFetch,
+    pluginName: name, budget, mcp, fetchImpl: proxyFetch,
     // 两个跨境旋钮必须真的传下去：不传就是恒 60s + 宿主默认 5 次重试（2026-11-17 修复）。
     requestTimeoutMs: config.requestTimeoutMs,
     retryPolicy: config.retryPolicy,
@@ -256,7 +277,12 @@ export function apply(ctx, config = {}) {
         const list = await fetchEquityInfo({ cookie, fetchImpl: proxyFetch, signal: refreshSignal() });
         // 成功但返回空列表（等级不含权益/接口结构变更）也要落盘：否则旧快照会一直
         // 被当成新鲜数据，把已经变化的额度继续按旧值判定。
-        if (!stopped) budget.setEquities(list);
+        if (!stopped) {
+          budget.setEquities(list);
+          // 官方余额是唯一的挂/摘依据：回源后立刻重算，耗尽的服务当场摘掉，
+          // 让内置工具接回去（否则模型会继续调一个必然超额失败的 MCP 工具）。
+          mcp.refresh();
+        }
       } catch { /* 保留旧数据；下轮周期或面板刷新再试 */ }
       finally { equityRefreshing = null; }
     })();
@@ -313,8 +339,16 @@ export function apply(ctx, config = {}) {
 
   const statusPayload = () => {
     const snapshot = catalog.snapshot();
+    const mcpStatus = mcp.status();
     return {
       ...budget.status(),
+      // Harness 权益 MCP 通道状态：面板据此标注每项权益此刻花的是「权益额度」还是「Credits」。
+      mcp: mcpStatus,
+      // 逐项来源：equity = 走 MCP 扣权益；credits = 走模型 API 扣 Credits。
+      // 面板不再只报余额，而是把「这笔钱从哪出」讲清楚（用户 2026-11-23 要求）。
+      equityChannels: Object.fromEntries(
+        (budget.equitiesState() ?? []).map((state) => [state.key, equityChannel(state.key, mcpStatus)]),
+      ),
       // 登录会话状态：waiting = 已开登录页等待收割；failed = 上次会话失败（面板给指引）。
       relogin: relogin.state(),
       provider: {
@@ -474,10 +508,16 @@ export function apply(ctx, config = {}) {
         providerId, acceptProviders: watchedProviders, fetchImpl: proxyFetch,
         logger: ctx.logger,
         budget,
+        // 生图双通道：权益额度还有且 MCP 连通就走 MCP（扣权益），否则回落模型 API（扣 Credits）。
+        mcp,
       });
       return () => { try { disposeTools(); } catch { /* best effort */ } };
     }, "qwen-token-plan-full: media tools");
   }
+
+  // MCP 权益通道的生命周期交给 Cordis：热切换/卸载时撤 guard、摘服务，不留悬挂工具。
+  ctx.effect(() => () => { try { mcp.dispose(); } catch { /* best effort */ } },
+    "qwen-token-plan-full: equity mcp");
 
   // 面板数据路由：GET status / POST refresh / POST login(±cancel)（仅同源）。
   ctx.effect(() => {
@@ -558,11 +598,20 @@ export function apply(ctx, config = {}) {
     };
   }, "qwen-token-plan-full: timers");
 
+  // 启动日志里的 MCP 一行：只说「有没有 Key」这个此刻确定的事实。
+  // 挂/摘是异步的（要等凭据解析），这里不报服务数，免得日志与真实状态打架。
+  const mcpBoot = mcp.status();
+  const bailianRef = String(config.bailianApiKeyEnv || "BAILIAN_PAYG_API_KEY");
+  const mcpBootText = !mcpBoot.enabled
+    ? (mcpBoot.reason === "no-manager" ? "关闭（宿主无 mcpManager）" : "关闭")
+    : (mcpBoot.keyPresent ? `已配 Key（${bailianRef}），按余额挂/摘` : `待配 Key（${bailianRef}），当前仍走模型 API 扣 Credits`);
+
   ctx.logger?.info?.(
     `${name}: ${registerProvider ? `已注册 provider "${providerId}"` : "观察-only（未注册 provider）"}` +
     `（Responses=${route.endpoint}；Chat=${route.chatEndpoint}；` +
     `站点 ${autoEndpoint ? "自动判定中" : "手动指定"}；空闲超时 ${adapter.requestTimeoutMs}ms；` +
     `内置工具 ${harnessMode.mode}；权益预算 ${budget.enabled ? "开启（等级自动上限）" : "关闭"}；` +
+    `权益 MCP ${mcpBootText}；` +
     `媒体工具 ${config.mediaTools === false ? "关闭" : "开启"}；调用观察 ${[...watched].join("/")}；` +
     `目录补货 ${feed ? `开启 → ${String(config.feedProvider || "qwentokenplan")}${config.feedReasoning === false ? "（不含档位）" : ""}` : "关闭"}；目录每 ${refreshMinutes} 分钟刷新；` +
     `套餐每 ${tierRefreshHours} 小时刷新；Cookie 失效${config.autoRelogin === false ? "不会" : "将"}自动开登录页收割）`,

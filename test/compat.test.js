@@ -306,59 +306,114 @@ test('video tool forwards duration and clamps invalid values',async()=>{
   } finally { rmSync(dir,{recursive:true,force:true}); }
 });
 
-test('image tool rejects n above remaining image entitlement before charging',async()=>{
-  // 剩 1 张时请求 n=4 必须在发出 HTTP 之前就被拒（回归：旧实现只判 remaining<=0，
-  // 于是「剩 1 张」仍会一次生成 4 张，多出的按套餐外 88 折后付费）。
+// 假 MCP 通道：callTool 真的走一遍 pick/buildArgs，好让「按上游 schema 匹配字段」
+// 这段逻辑被测试覆盖，而不是被一个直接返回结果的假对象绕过。
+function fakeMcp({state,images=['https://example.invalid/a.png'],schema,calls=[],fail=null}){
+  const parameters=schema??{type:'object',properties:{prompt:{type:'string'},model:{type:'string'},size:{type:'string'},n:{type:'integer'}}};
+  return {
+    usesEquity:key=>key==='image_generation'&&state().remaining>0,
+    callTool:async(service,exec,pick,buildArgs)=>{
+      const definition={name:'mcp__ImageGeneration__text_to_image',parameters,execute:async()=>{}};
+      const chosen=pick([{name:'text_to_image'}],[definition]);
+      const args=buildArgs(chosen.definition.parameters,chosen.rawName);
+      calls.push({service,args});
+      if(fail)throw fail;
+      return {tool:chosen.rawName,value:{structuredContent:{images}}};
+    },
+  };
+}
+
+test('image tool gates n against remaining entitlement on the MCP channel',async()=>{
+  // 权益通道上「剩 1 张却请求 n=4」必须在调用上游之前就被拒（回归：旧实现只判
+  // remaining<=0，于是剩 1 张仍一次生成 4 张，多出的按套餐外 88 折后付费）。
+  // 2026-11-23：这道闸只属于 MCP 权益通道；模型 API 通道花 Credits，见下一个测试。
   const dir=mkdtempSync(path.join(os.tmpdir(),'qtpf-img-'));
   try {
-    const definitions=[];const recorded=[];let requests=0;
+    const definitions=[];const recorded=[];const calls=[];let apiCalls=0;
+    let remaining=1;
+    const state=()=>({key:'image_generation',used:20-remaining,quota:20,remaining,unit:'张',source:'official'});
     const credentials={resolve:async()=>({value:'fixture'})};
     const workingDirectory={ensure:async()=>dir};
     const ctx={get:name=>name==='credentials'?credentials:workingDirectory,tools:{register:def=>{definitions.push(def);return ()=>{};}}};
-    const budget={equityState:()=>({key:'image_generation',used:19,quota:20,remaining:1,unit:'张',source:'local'}),
-      record:(key,count)=>{recorded.push([key,count]);return null;}};
-    const dispose=registerMediaTools(ctx,{apiKeyEnv:'TEST',pluginName:'test',origin:'https://example.invalid',chatEndpoint:'https://example.invalid/chat',imageModels:['image'],videoModels:['video'],defaultImageModel:'image',defaultVideoModel:'video',budget,fetchImpl:async()=>{
-      requests+=1;return Response.json({choices:[{message:{content:[{type:'image',image:'https://example.invalid/r.png'}]}}]});
-    }});
+    const budget={equityState:state,record:(key,count)=>{recorded.push([key,count]);return null;}};
+    const dispose=registerMediaTools(ctx,{apiKeyEnv:'TEST',pluginName:'test',origin:'https://example.invalid',chatEndpoint:'https://example.invalid/chat',imageModels:['image'],videoModels:['video'],defaultImageModel:'image',defaultVideoModel:'video',budget,
+      mcp:fakeMcp({state,calls}),
+      fetchImpl:async(url)=>{
+        // 只有生成端点算「打了模型 API」；MCP 通道也要经 fetchImpl 下载图片。
+        if(String(url).includes('multimodal-generation'))apiCalls+=1;
+        return String(url).includes('multimodal-generation')
+          ? Response.json({choices:[{message:{content:[{type:'image',image:'https://example.invalid/r.png'}]}}]})
+          : new Response('x',{headers:{'content-type':'image/png'}});
+      }});
     const imageTool=definitions[0];
     const exec={agent:{},signal:new AbortController().signal};
-    // 剩 1 张 + n=4 → 拒绝并说明剩余量，且不发出任何请求、不记账。
+    // 剩 1 张 + n=4 → 拒绝并说明剩余量，既不调上游也不发 HTTP、不记账。
     await assert.rejects(imageTool.execute({prompt:'p',n:4},exec),/仅剩 1 张/);
-    assert.equal(requests,0,'额度不足时不得先请求再算账');
+    assert.equal(calls.length,0,'额度不足时不得先调上游再算账');
+    assert.equal(apiCalls,0,'额度不足时不得回落模型 API 偷偷花 Credits');
     assert.deepEqual(recorded,[]);
-    // 剩 1 张 + n=1 → 正常生成，按实际张数（1）记账。
+    // 剩 1 张 + n=1 → 走 MCP 生成，按实际张数（1）记权益账。
     const result=await imageTool.execute({prompt:'p',n:1},exec);
     assert.equal(result.count,1);
+    assert.equal(result.model,'mcp:text_to_image','走的是 MCP 通道');
+    assert.equal(apiCalls,0,'权益通道不该打模型生成端点');
     assert.deepEqual(recorded,[['image_generation',1]]);
-    // 额度耗尽（remaining=0，n=1）同样拒绝。
-    budget.equityState=()=>({key:'image_generation',used:20,quota:20,remaining:0,unit:'张',source:'local'});
-    await assert.rejects(imageTool.execute({prompt:'p',n:1},exec),/仅剩 0 张/);
+    // 额度耗尽（remaining=0）→ MCP 不再可用，自动回落模型 API（用户选定策略），
+    // 这一次花 Credits，因此既不记权益账也不被权益余额拦住。
+    remaining=0;
+    const fallback=await imageTool.execute({prompt:'p',n:1},exec);
+    assert.equal(fallback.model,'image');
+    assert.equal(apiCalls,1);
+    assert.deepEqual(recorded,[['image_generation',1]],'回落通道不记权益账');
     dispose();
   } finally { rmSync(dir,{recursive:true,force:true}); }
 });
 
-test('image tool counts each downloaded image even when a later download fails', async () => {
-  // 回归（2026-11-13）：旧实现全部下载成功才 record(paths.length)，中途失败/abort
-  // → 已落盘的那几张全漏计 → 本地额度高估。每张成功即计 1，失败时已成功的仍计入。
-  const dir=mkdtempSync(path.join(os.tmpdir(),'qtpf-img-partial-'));
+test('model API channel neither gates on nor debits the image entitlement',async()=>{
+  // 2026-11-23 根因修正：sk-sp- Key 只抵扣 Credits、不参与 Harness 计量。
+  // 拿官方那 20 张去拦模型 API 是错位护栏（权益满着却拦掉能用的通道），
+  // 记 image_generation 更会把「没花掉的权益」显示成已用。两件事都不许做。
+  const dir=mkdtempSync(path.join(os.tmpdir(),'qtpf-img-credits-'));
   try {
-    const definitions=[];const recorded=[];
+    const definitions=[];const recorded=[];const requests=[];
     const credentials={resolve:async()=>({value:'fixture'})};
     const workingDirectory={ensure:async()=>dir};
     const ctx={get:name=>name==='credentials'?credentials:workingDirectory,tools:{register:def=>{definitions.push(def);return ()=>{};}}};
-    const budget={equityState:()=>({key:'image_generation',used:0,quota:20,remaining:20,unit:'张',source:'local'}),
-      record:(key,count)=>{recorded.push([key,count]);return null;}};
-    const dispose=registerMediaTools(ctx,{apiKeyEnv:'TEST',pluginName:'test',origin:'https://example.invalid',chatEndpoint:'https://example.invalid/chat',imageModels:['image'],videoModels:['video'],defaultImageModel:'image',defaultVideoModel:'video',budget,fetchImpl:async(url)=>{
-      // 2026-11-23：纯文本生图也统一走原生多模态端点（旧 mock 打 /chat 是钉住了 bug 行为）。
-      if(String(url).includes('multimodal-generation'))return Response.json({choices:[{message:{content:[{type:'image',image:'https://example.invalid/a.png'},{type:'image',image:'https://example.invalid/b.png'}]}}]});
-      if(String(url).endsWith('/b.png'))throw new Error('download boom');
-      return new Response('x',{headers:{'content-type':'image/png'}});
-    }});
+    const budget={equityState:()=>({key:'image_generation',used:20,quota:20,remaining:0,unit:'张',source:'official'}),
+      record:(key,count)=>{recorded.push([key,count]);return null;},recordRequest:()=>{requests.push(1);}};
+    const dispose=registerMediaTools(ctx,{apiKeyEnv:'TEST',pluginName:'test',origin:'https://example.invalid',chatEndpoint:'https://example.invalid/chat',imageModels:['image'],videoModels:['video'],defaultImageModel:'image',defaultVideoModel:'video',budget,fetchImpl:async()=>
+      Response.json({choices:[{message:{content:[{type:'image',image:'https://example.invalid/r.png'}]}}]})});
+    const result=await definitions[0].execute({prompt:'p',n:4},{agent:{},signal:new AbortController().signal});
+    assert.equal(result.count,1);
+    assert.deepEqual(recorded,[],'模型 API 不扣权益，不得记 image_generation');
+    assert.deepEqual(requests,[1],'模型调用仍计一次（Credits 口径）');
+    dispose();
+  } finally { rmSync(dir,{recursive:true,force:true}); }
+});
+
+test('MCP channel counts each saved image even when a later download fails', async () => {
+  // 回归（2026-11-13）：旧实现全部下载成功才 record(paths.length)，中途失败/abort
+  // → 已落盘的那几张全漏计 → 额度高估。每张成功即计 1，失败时已成功的仍计入。
+  // 2026-11-23：权益记账搬到 MCP 通道（模型 API 不扣权益），回归口径不变。
+  const dir=mkdtempSync(path.join(os.tmpdir(),'qtpf-img-partial-'));
+  try {
+    const definitions=[];const recorded=[];
+    const state=()=>({key:'image_generation',used:0,quota:20,remaining:20,unit:'张',source:'official'});
+    const credentials={resolve:async()=>({value:'fixture'})};
+    const workingDirectory={ensure:async()=>dir};
+    const ctx={get:name=>name==='credentials'?credentials:workingDirectory,tools:{register:def=>{definitions.push(def);return ()=>{};}}};
+    const budget={equityState:state,record:(key,count)=>{recorded.push([key,count]);return null;}};
+    const dispose=registerMediaTools(ctx,{apiKeyEnv:'TEST',pluginName:'test',origin:'https://example.invalid',chatEndpoint:'https://example.invalid/chat',imageModels:['image'],videoModels:['video'],defaultImageModel:'image',defaultVideoModel:'video',budget,
+      mcp:fakeMcp({state,images:['https://example.invalid/a.png','https://example.invalid/b.png']}),
+      fetchImpl:async(url)=>{
+        if(String(url).endsWith('/b.png'))throw new Error('download boom');
+        return new Response('x',{headers:{'content-type':'image/png'}});
+      }});
     const imageTool=definitions[0];
     const exec={agent:{},signal:new AbortController().signal};
     await assert.rejects(imageTool.execute({prompt:'p',n:2},exec),/download boom/);
     assert.deepEqual(recorded,[['image_generation',1]],'第一张已落盘：失败也必须计入（旧实现 record=[]）');
-    assert.equal(readdirSync(dir).filter(f=>f.startsWith('qwen-image')).length,1,'第一张确实已落盘');
+    assert.equal(readdirSync(dir).filter(f=>f.startsWith('qwen-image-mcp')).length,1,'第一张确实已落盘');
     dispose();
   } finally { rmSync(dir,{recursive:true,force:true}); }
 });

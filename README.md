@@ -43,6 +43,11 @@ dsh plugin --profile <profile> add link:/绝对路径/dsh-qwen-token-plan-full
   `QWEN_TOKEN_PLAN_CN_API_KEY`；缺失时请求报 `MISSING_CREDENTIAL`。
   权益面板的精确余额另需 `BAILIAN_CONSOLE_COOKIE`（`~/.dsh/.env` 或环境变量）；
   没有它时预算退回「官方周期配额 − 本地计数」的本地估算，功能不失效。
+- **想真正用上套餐单列的 Harness 权益**（那 20 张图、100 次搜索……）：还需一把
+  **百炼按量付费 Key**（`sk-` / `sk-ws-` 开头，[百炼控制台](https://bailian.console.aliyun.com/)
+  → API-KEY 创建），存为凭据引用 `BAILIAN_PAYG_API_KEY`。Token Plan 专属 Key（`sk-sp-`）
+  只抵扣 Credits、打 MCP 一律 401。没配这把 Key 时插件照常工作，只是所有调用都花 Credits，
+  面板会如实标出来。详见「Harness 权益 MCP 通道」。
 - **自动登录弹窗纪律**：只有本地**取不到** `BAILIAN_CONSOLE_COOKIE`（未配置/缺少）时插件才会自动开控制台登录页；
   Cookie 在但网关判它无效（过期/限流/瞬断）**不自动弹**——面板留错误文案，等下次定时刷新自愈，
   或你在面板手动点「一键登录」。自动会话还有 2 小时冷却与「失败当日不再弹」熔断。
@@ -61,13 +66,14 @@ dsh plugin --profile <profile> add link:/绝对路径/dsh-qwen-token-plan-full
 |---|---|---|
 | 模型目录 | 编译期冻结（2026-09-04 快照，9 个） | **动态**：出厂 14 个 + 每 30 分钟拉取线上 `/v1/models` 合并，新模型自动出现 |
 | dsh-llm 协议 | 面向 0.1.x（tool-result 内嵌块），0.2.x 上多轮工具对话会 400 | 面向 0.2.1：`role:"tool"` 独立消息 → `function_call_output` / chat `tool_call_id`，同时兼容 0.1.x 形状 |
-| 图片生成 | 无 | **`qwen_generate_image` 工具**：qwen-image-3.0-pro / wan2.7-image(-pro)，走 Token Plan 计费，自动下载到会话工作目录 |
+| 图片生成 | 无 | **`qwen_generate_image` 工具**：qwen-image-3.0-pro / wan2.7-image(-pro)，自动下载到会话工作目录。**双通道**：配了百炼按量付费 Key 就走 MCP 真扣套餐权益额度，否则回落模型 API 花 Credits |
+| Harness 权益 | 用不上（专属 Key 只扣 Credits） | **MCP 权益通道**：6 个百炼 MCP 服务覆盖 7 项权益，按余额挂/摘，面板逐项标注消耗来源 |
 | 视频生成 | 无 | **`qwen_generate_video` 工具**：wan3.0-video 异步任务 + 轮询 + 自动下载 mp4；`duration` 3-15 秒（默认 5 秒，Credits 随时长增加） |
 | 版本豁免 | 需要（peerDeps 只到 0.1.x） | 不需要（peerDeps 覆盖 0.2.1-rc.5 至 0.2.2-rc.x） |
 
 聊天能力与旧插件一致：千问/DeepSeek 系走 Responses API（服务端内置工具 web_search、code_interpreter、web_extractor、web_search_image、image_search，`harness: auto` 按模型能力取交集）；GLM 系走 Chat Completions（enable_thinking + reasoning_effort，未知 GLM 自动禁用 none 档，因服务端强制思考）。
 
-不收录：TTS/ASR（Token Plan 端点实测 404/500，仅 websocket 支持）、decision-model-preview（400 Unsupported model）。媒体模型（wan*/qwen-image*/qwen-audio*）自动排除出对话目录。
+不收录：TTS/ASR 的**模型端点**（Token Plan 端点实测 404/500，仅 websocket 支持）、decision-model-preview（400 Unsupported model）。媒体模型（wan*/qwen-image*/qwen-audio*）自动排除出对话目录。语音合成/识别自 v0.5.0 起改由百炼 MCP 服务提供（`mcp__TextToSpeech__*` / `mcp__SpeechToText__*`，需按量付费 Key），不再依赖那两个坏端点。
 
 ## 配置（cordis.patch.yml 的 config）
 
@@ -81,6 +87,9 @@ dsh plugin --profile <profile> add link:/绝对路径/dsh-qwen-token-plan-full
 | `retryPolicy` | `{mode:"normal",maxRetries:2,backoff:{initialDelayMs:1000,maxDelayMs:10000,jitterRatio:0.1}}` | 请求重试策略，交给宿主 `llm-retry` 执行。DSH 默认 5 次，跨境会把一次抖动放大成分钟级假死，故降到 2 次 |
 | `harness` | `auto` | `auto`/`none`/逗号列表（如 `web_search,web_extractor`） |
 | `mediaTools` | `true` | 关掉则不注册图片/视频工具 |
+| `bailianApiKeyEnv` | `BAILIAN_PAYG_API_KEY` | **百炼按量付费 Key** 的凭据引用名（`sk-`/`sk-ws-` 开头）。Harness 权益只认这把 key；Token Plan 专属 key（`sk-sp-`）打 MCP 一律 401，只会扣 Credits。没配就整条通道不挂，面板如实标「Credits」 |
+| `mcpEquity` | `auto` | 权益 MCP 通道：`auto` = 7 项权益全接（6 个服务，WebSearch 同时服务增强搜索与垂类搜索）；`off` 关闭；逗号列表按服务名精选（如 `ImageGeneration,WebSearch`）。视频无独立权益实例，默认不挂，要挂就显式写 `VideoGeneration` |
+| `mcpHost` | `https://maas.qianwenaiapi.com` | MCP 服务域名。国内站亦可写 `https://dashscope.aliyuncs.com`，路径同为 `/api/v1/mcps/<Service>/mcp` |
 | `imageModels` / `videoModels` / `defaultImageModel` / `defaultVideoModel` | 见上 | 媒体工具可选模型 |
 | `models` | `[]` | 手工覆盖/追加目录条目（同 id 浅合并；可救活目录没有的模型） |
 | `excludeModels` | `[]` | 按 id 或前缀排除 |
@@ -225,14 +234,17 @@ Node 的 `fetch` 默认**不读系统代理设置**，所以即使系统代理�
    这样别的设备/客户端/网页版用掉的额度也会被算进来，同时不遗漏刷新间隔内的新调用。
    控制台数据不可用时（Cookie 失效、从未拉取成功、超过新鲜度阈值，默认 15 分钟，
    `harnessBudget.equityFreshMinutes` 可调）退回本地估算：`剩余 = 官方周期配额 − 本周期调用次数`。
-   本地计数在每次响应流出现一个服务端工具调用（`web_search_call` / `web_extractor_call` /
-   `code_interpreter_call` / `web_search_image_call` …）时加一；`qwen_generate_image`
-   按返回张数计入图像生成额度。计数持久化在 `~/.dsh/qwen-token-plan-full.budget.json`
+   本地计数在每次 **MCP 权益调用**派发时加一（v0.5.0 起，见「Harness 权益 MCP 通道」）；
+   `qwen_generate_image` 走 MCP 时按落盘张数计入图像生成额度，走模型 API 时**不记权益**
+   （那条路花的是 Credits，记了会把没花掉的权益显示成已用）。服务端内置工具调用同样不记权益。
+   计数持久化在 `~/.dsh/qwen-token-plan-full.budget.json`
    （重启不丢），周期翻转自动清零恢复。每项判定依据可在面板 status 的 `source` 字段看到
    （`official` = 官网余额，`local` = 本地兜底）。
 4. **某项额度耗尽后：请求不再声明该权益对应的工具**（其余权益、模型调用、DSH 本地工具不受影响；
    同名 DSH 本地工具会自动接管，见下），宿主日志提示一次并标明依据；
-   `qwen_generate_image` 在额度耗尽时直接报错拒调。周期重置或官网余额回升后自动恢复。
+   `qwen_generate_image` 走 MCP 权益通道时按剩余张数拦住超量请求（n 太大直接报错，不扣钱），
+   额度耗尽则摘掉 ImageGeneration 服务、自动回落模型 API（开始花 Credits）。
+   周期重置或官网余额回升后自动恢复。
 5. 网关不可达（Cookie 失效/断网）时用 `tier` 配置或内置 standard 等级兜底，预算机制不失效。
 6. **为什么必须拦**：Harness 权益用尽后不会自动停，超出部分按目录价 88 折**后付费**
    （不占套餐 Credits/量包）。控制台没有「用完即停」开关，只能由客户端停止声明工具来做到。
@@ -244,9 +256,49 @@ Node 的 `fetch` 默认**不读系统代理设置**，所以即使系统代理�
 视频生成；Lite/Essential 显示升级提示）。行值为「剩余/周期总额」：总额 = 官方周期配额
 （不折算），剩余 = 配额 − 本周期调用次数；语音识别按小时显示，视频生成无周期配额显示 ✓ 包含。
 额度耗尽的行置灰标橙并计入顶部警示。徽标悬浮提示列出各项「剩余/配额」摘要。
+**每行末尾带消耗来源标签**（v0.5.0 起）：绿色「权益」= 这次真在扣套餐单列的权益额度；
+黄色「Credits」= 这项还没走通 MCP，调用在花套餐 Credits。下方「权益通道」一行显示
+`已连通 n/6`；没配百炼按量付费 Key 时直接写明「现在每次调用都在花 Credits」并给出凭据名。
 弹层交互仿模型切换器：无按钮，点徽标即打开并强制回源刷新，点弹层外任意处（透明遮罩）关闭，
 Esc 也可关闭。数据同源口径：套餐剩余 = 网关 `per1MonthPercentage` 取反，Credits 按月配额折算。
 数据走同源只读路由 `GET /qwen-token-plan-full/status`、`POST /qwen-token-plan-full/refresh`。
+
+## Harness 权益 MCP 通道（v0.5.0 起）
+
+**为什么要有这条通道**：Token Plan 专属 Key（`sk-sp-` 开头）**只能用于模型调用抵扣 Credits**，
+不用于 Harness 服务。用它打模型端点生图、或让模型声明服务端内置工具，扣的都是 Credits，
+套餐单列的那 20 张图像生成、100 次联网搜索……一次都不会动（实测官方余额长期满格，
+而套餐用量百分比在涨）。Harness 权益必须用**百炼按量付费 Key**（`sk-` / `sk-ws-` 开头）
+调百炼 MCP 服务才计入。依据：[Token Plan Harness 权益说明](https://help.aliyun.com/zh/model-studio/token-plan-harness-benefits)。
+
+**怎么接**：插件用宿主自带的 `mcpManager.register()` 挂 MCP 服务（零新增依赖、不改 profile）：
+
+| 服务 | 覆盖权益 | 抑制的服务端内置工具 |
+|---|---|---|
+| `WebSearch` | 联网搜索增强 + 垂类搜索 | `web_search` / `web_search_image` / `image_search` |
+| `WebParser` | 网页解析 | `web_extractor` |
+| `CodeInterpreter` | 代码解释器 | `code_interpreter` |
+| `TextToSpeech` / `SpeechToText` | 语音合成 / 语音识别 | 无（内置工具里没有对应项） |
+| `ImageGeneration` | 图像生成 | 无（`qwen_generate_image` 自己切通道） |
+
+- 端点 `${mcpHost}/api/v1/mcps/<Service>/mcp`（streamable-http）。鉴权头写
+  `Bearer ${credential:BAILIAN_PAYG_API_KEY}` **模板**交宿主展开——明文 Key 不进配置、
+  不进日志、不进 status。Key 后补时凭据事件 `credentials/reference-updated` 触发自动补挂，
+  **不用重启**。
+- **按余额挂/摘**：某项权益余额为 0 就摘掉对应服务，同时把服务端内置工具还回去
+  （否则那个能力就整个消失了）；余额回升自动挂回。余额未知（还没回源）时先挂着让它试。
+- **只有真连通才算权益**：抑制内置工具、切换生图通道、面板标绿都只认宿主报的
+  `connected` 状态。注册了但连不上（401/断网）时一律按 Credits 处理，绝不谎报省钱。
+- **没配 Key 就整条通道不挂**：挂了也是 401，只会给模型塞一堆用不了的工具、给日志刷错误。
+  此时面板每行标「Credits」并提示去哪配 Key。
+- 记账走 `tools.guard`：派发前乐观 +1（guard 拿不到成功与否），真实口径由控制台回源对齐。
+- 视频生成没有独立权益实例（按 Credits 计），默认不挂 `VideoGeneration`，
+  以免与 `qwen_generate_video` 重复暴露同一能力。
+
+**`qwen_generate_image` 双通道**：MCP 就绪且还有权益余额 → 走 MCP（真扣那 20 张）；
+否则走模型 API（花 Credits）。上游调用失败才回落；**产物落盘失败直接报错、不回落**——
+权益已经扣掉了，再走一遍模型 API 等于同一张图收两次钱。上游工具名与参数按宿主同步来的
+真实 JSON Schema 匹配（不猜字段名），返回的 URL 与内联 base64 都能落盘。
 
 ## 未知新模型的推断规格
 
@@ -258,6 +310,11 @@ Esc 也可关闭。数据同源口径：套餐剩余 = 网关 `per1MonthPercenta
 - 图片 `size`/`n` 经实测走请求体顶层 `parameters` 字段原生透传；顶层 `size`/`n` 会被忽略。
 - 视频任务超 15 分钟未完成会报错并附 task_id，可稍后人工查询。
 - 生成结果的签名 URL 约 24 小时过期；文件已落盘不受影响。
+- **MCP 权益通道依赖宿主 `mcpManager`**（DSH 自带 `@deepseek-ai/dsh-mcp-manager`，本 profile 已 active）。
+  宿主没有它时通道整体降级为 Credits，插件其余功能不受影响，面板会说明原因。
+- MCP 记账是**派发前乐观计数**（`tools.guard` 拿不到成功与否），失败调用也会先 +1；
+  真实口径以控制台回源为准（默认 15 分钟新鲜度）。
+- MCP 生图暂不支持本地参考图（`referenceImage`）：带参考图时直接走模型 API。
 
 ## 与 DSH 0.2.1-rc.5 的兼容修复（插件 0.2.1）
 
@@ -270,7 +327,7 @@ Esc 也可关闭。数据同源口径：套餐剩余 = 网关 `per1MonthPercenta
 
 ### 本地验证
 
-在插件目录执行 `npm test`（161 项：compat + relogin + stream + tier-retry + route-guard + model-display + catalog-feed + observer + capability-probe + config-knobs + stream-resilience + probe-integrity + media-safety + budget-merge，含媒体下载 SSRF/重定向、流内错误分类、探测完整性、跨实例预算合并、纯文本生图端点回归）。runner 逐文件串行执行（Windows 上唯一全绿的组合，见 `test/run.mjs` 注释）。另有 `test/client-smoke.mjs` 单独跑（面板渲染桩，不在 runner 内）。
+在插件目录执行 `npm test`（175 项：compat + relogin + stream + tier-retry + route-guard + model-display + catalog-feed + observer + capability-probe + config-knobs + stream-resilience + probe-integrity + media-safety + budget-merge + mcp-equity，含媒体下载 SSRF/重定向、流内错误分类、探测完整性、跨实例预算合并、纯文本生图端点回归、MCP 权益通道挂/摘与双通道计费口径）。runner 逐文件串行执行（Windows 上唯一全绿的组合，见 `test/run.mjs` 注释）。另有 `test/client-smoke.mjs` 单独跑（面板渲染桩，不在 runner 内；含 v0.5.0 的来源标签与权益通道断言：缺 Key 时全标 Credits 且给出凭据名、连通项标绿、未连通项仍标 Credits、无 mcpManager 时说明原因）。
 `test/config-knobs.test.js` 钉死两个跨境旋钮与站点自动判定：默认值与最坏墙钟、非法值拒绝、
 `providerRetryPolicy` 真的把策略交给宿主、真实 HTTP 服务器上卡死的流在**配置的**阈值处报 TIMEOUT、
 国际站 key 自动切新加坡、断网不失活、换站点后媒体工具与目录一起跟随、
@@ -282,6 +339,31 @@ Esc 也可关闭。数据同源口径：套餐剩余 = 网关 `per1MonthPercenta
 测试使用本机已安装的 DeepSeek Harness 内置运行时与真实 `dsh-llm` 类，不访问网络、不读取个人凭据。其他安装路径可通过 `DSH_TEST_NODE` 和 `DSH_TEST_RUNTIME` 指定。
 
 真实联网验证需单独进行；正常测试不会运行图片或视频生成。
+
+## v0.5.0（2026-11-23，Harness 权益 MCP 通道）
+
+**修的是一个计费口径错误，不是崩溃**：此前所有「权益」调用其实都在花套餐 Credits——
+Token Plan 专属 Key（`sk-sp-`）只用于模型调用，Harness 权益必须用百炼按量付费 Key
+（`sk-`/`sk-ws-`）调 MCP 才计入。现象是权益页 7 项长期满格（图像生成 20/20），
+而套餐用量百分比从 1% 涨到 1.74%。旧版还按那 20 张免费额度去拦 `qwen_generate_image`，
+护栏错位：拦的是没在花的额度，放过的每张都在花 Credits。
+
+改动：
+
+- 新增 `lib/mcp-equity.js`：用宿主 `mcpManager.register()` 挂 6 个百炼 MCP 服务覆盖 7 项权益，
+  鉴权走 `${credential:...}` 模板（明文 Key 不落任何地方），按余额挂/摘，
+  `tools.guard` 乐观记账，Key 后补经凭据事件自动补挂。
+- 新增配置 `bailianApiKeyEnv` / `mcpEquity` / `mcpHost`；`status` 新增 `mcp` 与 `equityChannels`。
+- `qwen_generate_image` 双通道：MCP 优先真扣权益，上游失败才回落模型 API；
+  落盘失败不回落（避免同一张图收两次钱）；模型 API 分支不再记权益。
+- adapter 在声明服务端内置工具前剔除已被 MCP 接管的能力，且只认「真连通」的服务。
+- 面板每行加消耗来源标签（绿「权益」/黄「Credits」）+「权益通道 已连通 n/6」+ 缺 Key 提示。
+
+**175 项离线回归全部通过**（新增 `mcp-equity` 13、`compat` +1）。新增用例专门盯住三件容易
+写错的事：缺 Key 时一个服务都不挂且面板如实说在花 Credits；注册了但连不上时既不摘内置工具
+也不标绿；额度耗尽摘服务的同时把内置工具还回去。热重载后实测 `status`：
+`mcp.reason="missing-key"`、6 个服务 `mounted:false`、7 项 `equityChannels` 全 `credits`
+——与「还没配 Key，所以现在确实在花 Credits」的事实一致。真实扣减待 Key 到位后验证。
 
 ## v0.4.3（2026-11-23，纯文本生图端点修复）
 

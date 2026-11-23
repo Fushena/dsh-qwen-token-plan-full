@@ -155,4 +155,47 @@ calm.paused = { any: false, reason: null, exhausted: [], until: null };
 const calmJson = renderWith(null, calm);
 assert.ok(calmJson.includes('⚡ 权益'), '未耗尽时徽标显示「⚡ 权益」');
 
+// —— v0.5.0：每项权益的消耗来源标签 + 权益通道状态 ——
+// 这是用户明确要的东西：余额之外还要看清「这笔钱从哪出」。
+// 缺 Key 时必须如实说在花 Credits，不能因为权益满格就让人以为在省钱。
+const noKey = structuredClone(STATUS);
+noKey.equityChannels = Object.fromEntries(COUNTS.map((c) => [c.key, 'credits']));
+noKey.mcp = {
+  enabled: true, reason: 'missing-key', keyPresent: false,
+  host: 'https://maas.qianwenaiapi.com', credentialRef: 'BAILIAN_PAYG_API_KEY',
+  servers: [{ service: 'ImageGeneration', equityKeys: ['image_generation'], mounted: false }],
+};
+const noKeyJson = renderWith('budget', noKey);
+assert.ok(noKeyJson.includes('qtpf-src credits'), '缺 Key 时每行标「Credits」来源');
+assert.ok(!noKeyJson.includes('qtpf-src equity'), '缺 Key 时不得标绿「权益」');
+assert.ok(noKeyJson.includes('未配置百炼按量付费 Key'), '缺 Key 时面板给出明确原因');
+assert.ok(noKeyJson.includes('BAILIAN_PAYG_API_KEY'), '缺 Key 时告诉用户该配哪个凭据名');
+assert.ok(noKeyJson.includes('现在每次调用都在花 Credits'), '缺 Key 时点明真实计费口径');
+
+// MCP 连通：对应项标绿「权益」，未接通的项仍标「Credits」。
+const connected = structuredClone(noKey);
+connected.equityChannels = { ...connected.equityChannels, image_generation: 'equity', search_pro: 'equity' };
+connected.mcp = {
+  enabled: true, reason: 'mounted', keyPresent: true,
+  host: 'https://maas.qianwenaiapi.com', credentialRef: 'BAILIAN_PAYG_API_KEY',
+  servers: [
+    { service: 'ImageGeneration', equityKeys: ['image_generation'], mounted: true, state: 'connected' },
+    { service: 'WebSearch', equityKeys: ['search_pro', 'vertical_search'], mounted: true, state: 'connected' },
+    { service: 'WebParser', equityKeys: ['webfetch'], mounted: false, reason: '网页解析权益额度耗尽' },
+  ],
+};
+const connectedJson = renderWith('budget', connected);
+assert.ok(connectedJson.includes('qtpf-src equity'), 'MCP 连通的项标绿「权益」');
+assert.ok(connectedJson.includes('qtpf-src credits'), '未接通的项仍标「Credits」');
+assert.ok(connectedJson.includes('权益通道'), '面板含「权益通道」状态行');
+assert.ok(connectedJson.includes('2/3'), '权益通道显示已连通数/总数');
+assert.ok(connectedJson.includes('自动回落模型 API'), '有服务因额度耗尽摘除时说明已回落');
+assert.ok(!connectedJson.includes('未配置百炼按量付费 Key'), '有 Key 时不再提示缺 Key');
+
+// 宿主没有 mcpManager：说明原因，而不是静默什么都不显示。
+const noManager = structuredClone(STATUS);
+noManager.mcp = { enabled: false, reason: 'no-manager', servers: [] };
+const noManagerJson = renderWith('budget', noManager);
+assert.ok(noManagerJson.includes('宿主未提供 MCP 服务'), '无 mcpManager 时面板说明原因');
+
 console.log('client-smoke: 全部断言通过 ✔');
