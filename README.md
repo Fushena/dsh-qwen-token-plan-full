@@ -307,6 +307,9 @@ v0.5.1 起七项权益一一对应七个真实服务，实测全部 `connected`�
 - **没配 Key 就整条通道不挂**：挂了也是 401，只会给模型塞一堆用不了的工具、给日志刷错误。
   此时面板每行标「Credits」并提示去哪配 Key。
 - 记账走 `tools.guard`：派发前乐观 +1（guard 拿不到成功与否），真实口径由控制台回源对齐。
+  guard 收到的 `exec` 形状是 `{ name, callId, arguments, signal, … }`（宿主
+  `dsh-tools/lib/pipeline.js` 的 `createExecution`），**没有 `exec.tool`**；按权益键记账，
+  七个键在 `TOOL_TO_EQUITY` 里都有自映射（`tts`/`asr` 没有内置工具类型，只能走这条路）。
 - **官方余额不是实时的**：阿里云按量付费出账有 1–3 小时延迟（[官方说明](https://www.alibabacloud.com/help/zh/user-center/bill-solution-troubleshooting-manual-for-common-consumer-bill-questions)），
   所以刚调用完控制台仍显示满额是正常现象，不代表没走权益通道。判断通道是否生效看
   `status.mcp.servers[].state` 与生图返回的 `model` 前缀（`mcp:` = 走了权益通道），
@@ -346,7 +349,7 @@ v0.5.1 起七项权益一一对应七个真实服务，实测全部 `connected`�
 
 ### 本地验证
 
-在插件目录执行 `npm test`（175 项：compat + relogin + stream + tier-retry + route-guard + model-display + catalog-feed + observer + capability-probe + config-knobs + stream-resilience + probe-integrity + media-safety + budget-merge + mcp-equity，含媒体下载 SSRF/重定向、流内错误分类、探测完整性、跨实例预算合并、纯文本生图端点回归、MCP 权益通道挂/摘与双通道计费口径）。runner 逐文件串行执行（Windows 上唯一全绿的组合，见 `test/run.mjs` 注释）。另有 `test/client-smoke.mjs` 单独跑（面板渲染桩，不在 runner 内；含 v0.5.0 的来源标签与权益通道断言：缺 Key 时全标 Credits 且给出凭据名、连通项标绿、未连通项仍标 Credits、无 mcpManager 时说明原因）。
+在插件目录执行 `npm test`（176 项：compat + relogin + stream + tier-retry + route-guard + model-display + catalog-feed + observer + capability-probe + config-knobs + stream-resilience + probe-integrity + media-safety + budget-merge + mcp-equity，含媒体下载 SSRF/重定向、流内错误分类、探测完整性、跨实例预算合并、纯文本生图端点回归、MCP 权益通道挂/摘与双通道计费口径）。runner 逐文件串行执行（Windows 上唯一全绿的组合，见 `test/run.mjs` 注释）。另有 `test/client-smoke.mjs` 单独跑（面板渲染桩，不在 runner 内；含 v0.5.0 的来源标签与权益通道断言：缺 Key 时全标 Credits 且给出凭据名、连通项标绿、未连通项仍标 Credits、无 mcpManager 时说明原因）。
 `test/config-knobs.test.js` 钉死两个跨境旋钮与站点自动判定：默认值与最坏墙钟、非法值拒绝、
 `providerRetryPolicy` 真的把策略交给宿主、真实 HTTP 服务器上卡死的流在**配置的**阈值处报 TIMEOUT、
 国际站 key 自动切新加坡、断网不失活、换站点后媒体工具与目录一起跟随、
@@ -359,7 +362,7 @@ v0.5.1 起七项权益一一对应七个真实服务，实测全部 `connected`�
 
 真实联网验证需单独进行；正常测试不会运行图片或视频生成。
 
-## v0.5.1（2026-11-23，MCP 服务名实测修正）
+## v0.5.2（2026-11-23，MCP 服务名实测修正 + 权益记账漏映射）
 
 v0.5.0 的 MCP 服务名是照百炼商店的**中文标题**推的英文名，拿到真实 `sk-ws-` Key 后逐个探测
 才发现多数根本不存在。这是本版唯一的实质缺陷，但它让整条权益通道形同虚设。
@@ -391,9 +394,20 @@ v0.5.0 的 MCP 服务名是照百炼商店的**中文标题**推的英文名，�
 `WebSearch` 会导致垂类搜索永远扣不到自己的额度、且任一项耗尽会误摘另一项。现在七项权益
 一一对应七个服务，`equityKeysOfService` 仍返回数组以备上游将来合并。
 
-**验证**：`npm test` 175 项全绿（服务数断言 6→7、搜索额度独立性、guard 分项记账均已改）；
+**记账漏映射修正**：`TOOL_TO_EQUITY` 原先只收服务端内置工具类型（`web_search` 等），
+而 MCP 通道的 guard 是**按权益键**记账的。`code_interpreter`/`image_generation` 恰好同名
+所以蒙对了，`tts`/`asr`/`search_pro`/`vertical_search`/`webfetch` 查不到映射就被
+`record()` 静默丢弃——语音权益调了也不计数，面板永远显示 0。现在七个权益键全部自映射。
+同时删掉 `lib/mcp-equity.js` 里没人用的 `TOOL_TO_EQUITY` 再导出。
+
+**验证**：`npm test` 176 项全绿（服务数断言 6→7、搜索额度独立性、guard 分项记账、
+权益键自映射回归均已覆盖；guard 测试改用真实 `exec` 形状 `{ name, callId, … }`——
+宿主 `dsh-tools/lib/pipeline.js` 的 `createExecution` 里**没有 `exec.tool`**，
+早先只按 `exec.tool.name` 写测试会漏掉真形状）；
 热重载后实测 7 个服务全部 `connected`、`equityChannels` 七项全 `equity`；
-真实调用 `qwen_generate_image` 返回 `model="mcp:bailian_image_gen"`，产物落盘正常。
+真实调用 `qwen_generate_image` 返回 `model="mcp:bailian_image_gen"`，产物落盘正常；
+`mcp__EnhancedSearch__search_pro` 与 `mcp__TextGenerateSpeech__bailian_tts` 均调用成功，
+修复后 tts 本地计数 `0 → 1`、面板显示 `used=1/10000 remaining=9999`。
 官方余额因按量付费出账延迟（1–3 小时）当时仍显示满额，属预期，见「已知边界」。
 
 ## v0.5.0（2026-11-23，Harness 权益 MCP 通道）
@@ -415,7 +429,7 @@ Token Plan 专属 Key（`sk-sp-`）只用于模型调用，Harness 权益必须�
 - adapter 在声明服务端内置工具前剔除已被 MCP 接管的能力，且只认「真连通」的服务。
 - 面板每行加消耗来源标签（绿「权益」/黄「Credits」）+「权益通道 已连通 n/7」+ 缺 Key 提示。
 
-**175 项离线回归全部通过**（新增 `mcp-equity` 13、`compat` +1）。新增用例专门盯住三件容易
+**176 项离线回归全部通过**（新增 `mcp-equity` 13、`compat` +1）。新增用例专门盯住三件容易
 写错的事：缺 Key 时一个服务都不挂且面板如实说在花 Credits；注册了但连不上时既不摘内置工具
 也不标绿；额度耗尽摘服务的同时把内置工具还回去。热重载后实测 `status`：
 `mcp.reason="missing-key"`、7 个服务 `mounted:false`、7 项 `equityChannels` 全 `credits`

@@ -90,6 +90,40 @@ test("A2 跨实例交替 record：byEquity 按增量累加，不互吞", (t) => 
   assert.equal(disk.byEquity.image_generation, 2);
 });
 
+test("A2b 权益键本身可作 record 输入：tts/asr 没有内置工具类型，只能走这条路", (t) => {
+  // MCP 通道的 guard 直接按权益键记账（lib/mcp-equity.js）。tts/asr 在
+  // TOOL_TO_EQUITY 里若没有自映射，record 查不到 key 就静默丢弃，面板永远显示 0。
+  const { filePath, logger, readState } = setup(t);
+  const a = new HarnessBudget({ filePath, logger });
+  // 新实例还没有档位（specCode 未知）→ equityState 返回 null，但**计数必须照记**。
+  a.record("tts", 12);
+  a.record("asr", 30);
+  // 其余五项权益键同样要能直接记账（guard 对七个服务一视同仁）。
+  a.record("search_pro");
+  a.record("vertical_search");
+  a.record("webfetch");
+  a.record("code_interpreter");
+  a.record("image_generation");
+  const disk = readState();
+  assert.equal(disk.byEquity.tts, 12, "tts 漏映射会被静默丢弃");
+  assert.equal(disk.byEquity.asr, 30, "asr 漏映射会被静默丢弃");
+  assert.equal(disk.byEquity.search_pro, 1);
+  assert.equal(disk.byEquity.vertical_search, 1);
+  assert.equal(disk.byEquity.webfetch, 1);
+  assert.equal(disk.byEquity.code_interpreter, 1);
+  assert.equal(disk.byEquity.image_generation, 1);
+  // 内置工具类型这条老路必须仍然好使（不能因为加自映射而回归）。
+  a.record("web_search");
+  assert.equal(readState().byEquity.search_pro, 2);
+  // 未知类型仍然不计数（不凭空造权益键）。
+  a.record("no_such_thing");
+  assert.equal(readState().byEquity.no_such_thing, undefined);
+  // 档位确定后，这两项要能正常出现在面板状态里。
+  a.setTierFallback("test");
+  assert.equal(a.equityState("tts")?.used, 12);
+  assert.equal(a.equityState("asr")?.used, 30);
+});
+
 test("A3 周期边界：磁盘已滚入新周期，本实例旧周期计数不得覆写回去", (t) => {
   const { filePath, logger, writeState, readState } = setup(t);
   const now = Date.now();

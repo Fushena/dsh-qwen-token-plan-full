@@ -216,14 +216,20 @@ test('the guard counts MCP dispatches optimistically and never rejects a call', 
   assert.equal(host.guards.length, 1);
   const guard = host.guards[0];
   // guard 在派发前运行、拿不到成功与否 → 只能乐观计数；口径由官方回源对齐。
-  assert.equal(guard({ tool: { name: 'mcp__EnhancedSearch__search' } }), undefined);
+  // 真实 exec 的形状是 { name, callId, arguments, signal, … }（dsh-tools/lib/pipeline.js
+  // createExecution），**没有 exec.tool** —— 早先只按 exec.tool.name 写测试会漏掉真形状。
+  assert.equal(guard({ name: 'mcp__EnhancedSearch__search_pro', callId: 'c1' }), undefined);
   assert.deepEqual(recorded, [['search_pro', 1]], '增强搜索只记自己那项额度');
   assert.equal(guard({ tool: { name: 'mcp__VerticalSearch__image_search' } }), undefined);
   assert.deepEqual(recorded, [['search_pro', 1], ['vertical_search', 1]], '垂类搜索记自己的额度');
+  // 语音两项没有服务端内置工具类型，只能按权益键记账；漏了映射会被静默丢弃。
+  assert.equal(guard({ name: 'mcp__TextGenerateSpeech__bailian_tts' }), undefined);
+  assert.equal(guard({ name: 'mcp__SpeechGenerateText__bailian_asr' }), undefined);
+  assert.deepEqual(recorded.slice(2), [['tts', 1], ['asr', 1]], '语音权益也要记上');
   // 非 MCP 工具、未注册的服务都不记账，也一律放行。
   assert.equal(guard({ tool: { name: 'web_search' } }), undefined);
   assert.equal(guard({ tool: { name: 'mcp__Unknown__x' } }), undefined);
-  assert.equal(recorded.length, 2);
+  assert.equal(recorded.length, 4);
   mcp.dispose();
   assert.equal(host.guards.length, 0, 'dispose 必须撤掉 guard');
 });
