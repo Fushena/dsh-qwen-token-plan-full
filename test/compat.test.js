@@ -313,7 +313,7 @@ function fakeMcp({state,images=['https://example.invalid/a.png'],schema,calls=[]
   return {
     usesEquity:key=>key==='image_generation'&&state().remaining>0,
     callTool:async(service,exec,pick,buildArgs)=>{
-      const definition={name:'mcp__ImageGeneration__text_to_image',parameters,execute:async()=>{}};
+      const definition={name:'mcp__TextGenerateImage__text_to_image',parameters,execute:async()=>{}};
       const chosen=pick([{name:'text_to_image'}],[definition]);
       const args=buildArgs(chosen.definition.parameters,chosen.rawName);
       calls.push({service,args});

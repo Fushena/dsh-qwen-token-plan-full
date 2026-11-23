@@ -162,8 +162,8 @@ const noKey = structuredClone(STATUS);
 noKey.equityChannels = Object.fromEntries(COUNTS.map((c) => [c.key, 'credits']));
 noKey.mcp = {
   enabled: true, reason: 'missing-key', keyPresent: false,
-  host: 'https://maas.qianwenaiapi.com', credentialRef: 'BAILIAN_PAYG_API_KEY',
-  servers: [{ service: 'ImageGeneration', equityKeys: ['image_generation'], mounted: false }],
+  host: 'https://dashscope.aliyuncs.com', credentialRef: 'BAILIAN_PAYG_API_KEY',
+  servers: [{ service: 'TextGenerateImage', equityKeys: ['image_generation'], mounted: false }],
 };
 const noKeyJson = renderWith('budget', noKey);
 assert.ok(noKeyJson.includes('qtpf-src credits'), '缺 Key 时每行标「Credits」来源');
@@ -177,11 +177,11 @@ const connected = structuredClone(noKey);
 connected.equityChannels = { ...connected.equityChannels, image_generation: 'equity', search_pro: 'equity' };
 connected.mcp = {
   enabled: true, reason: 'mounted', keyPresent: true,
-  host: 'https://maas.qianwenaiapi.com', credentialRef: 'BAILIAN_PAYG_API_KEY',
+  host: 'https://dashscope.aliyuncs.com', credentialRef: 'BAILIAN_PAYG_API_KEY',
   servers: [
-    { service: 'ImageGeneration', equityKeys: ['image_generation'], mounted: true, state: 'connected' },
-    { service: 'WebSearch', equityKeys: ['search_pro', 'vertical_search'], mounted: true, state: 'connected' },
-    { service: 'WebParser', equityKeys: ['webfetch'], mounted: false, reason: '网页解析权益额度耗尽' },
+    { service: 'TextGenerateImage', equityKeys: ['image_generation'], mounted: true, state: 'connected' },
+    { service: 'EnhancedSearch', equityKeys: ['search_pro'], mounted: true, state: 'connected' },
+    { service: 'WebFetch', equityKeys: ['webfetch'], mounted: false, reason: '网页解析权益额度耗尽' },
   ],
 };
 const connectedJson = renderWith('budget', connected);

@@ -73,7 +73,7 @@ dsh plugin --profile <profile> add link:/绝对路径/dsh-qwen-token-plan-full
 
 聊天能力与旧插件一致：千问/DeepSeek 系走 Responses API（服务端内置工具 web_search、code_interpreter、web_extractor、web_search_image、image_search，`harness: auto` 按模型能力取交集）；GLM 系走 Chat Completions（enable_thinking + reasoning_effort，未知 GLM 自动禁用 none 档，因服务端强制思考）。
 
-不收录：TTS/ASR 的**模型端点**（Token Plan 端点实测 404/500，仅 websocket 支持）、decision-model-preview（400 Unsupported model）。媒体模型（wan*/qwen-image*/qwen-audio*）自动排除出对话目录。语音合成/识别自 v0.5.0 起改由百炼 MCP 服务提供（`mcp__TextToSpeech__*` / `mcp__SpeechToText__*`，需按量付费 Key），不再依赖那两个坏端点。
+不收录：TTS/ASR 的**模型端点**（Token Plan 端点实测 404/500，仅 websocket 支持）、decision-model-preview（400 Unsupported model）。媒体模型（wan*/qwen-image*/qwen-audio*）自动排除出对话目录。语音合成/识别自 v0.5.0 起改由百炼 MCP 服务提供（`mcp__TextGenerateSpeech__*` / `mcp__SpeechGenerateText__*`，需按量付费 Key），不再依赖那两个坏端点。
 
 ## 配置（cordis.patch.yml 的 config）
 
@@ -88,8 +88,8 @@ dsh plugin --profile <profile> add link:/绝对路径/dsh-qwen-token-plan-full
 | `harness` | `auto` | `auto`/`none`/逗号列表（如 `web_search,web_extractor`） |
 | `mediaTools` | `true` | 关掉则不注册图片/视频工具 |
 | `bailianApiKeyEnv` | `BAILIAN_PAYG_API_KEY` | **百炼按量付费 Key** 的凭据引用名（`sk-`/`sk-ws-` 开头）。Harness 权益只认这把 key；Token Plan 专属 key（`sk-sp-`）打 MCP 一律 401，只会扣 Credits。没配就整条通道不挂，面板如实标「Credits」 |
-| `mcpEquity` | `auto` | 权益 MCP 通道：`auto` = 7 项权益全接（6 个服务，WebSearch 同时服务增强搜索与垂类搜索）；`off` 关闭；逗号列表按服务名精选（如 `ImageGeneration,WebSearch`）。视频无独立权益实例，默认不挂，要挂就显式写 `VideoGeneration` |
-| `mcpHost` | `https://maas.qianwenaiapi.com` | MCP 服务域名。国内站亦可写 `https://dashscope.aliyuncs.com`，路径同为 `/api/v1/mcps/<Service>/mcp` |
+| `mcpEquity` | `auto` | 权益 MCP 通道：`auto` = 7 项权益一一对应 7 个真实服务；`off` 关闭；逗号列表按服务名精选（如 `TextGenerateImage,EnhancedSearch`）。视频无独立权益实例，默认不挂，要挂就显式写 `VideoGenerate` |
+| `mcpHost` | `https://dashscope.aliyuncs.com` | MCP 服务域名。千问 One Key 域名 `https://maas.qianwenaiapi.com` 亦可用，路径同为 `/api/v1/mcps/<Service>/mcp` |
 | `imageModels` / `videoModels` / `defaultImageModel` / `defaultVideoModel` | 见上 | 媒体工具可选模型 |
 | `models` | `[]` | 手工覆盖/追加目录条目（同 id 浅合并；可救活目录没有的模型） |
 | `excludeModels` | `[]` | 按 id 或前缀排除 |
@@ -243,7 +243,7 @@ Node 的 `fetch` 默认**不读系统代理设置**，所以即使系统代理�
 4. **某项额度耗尽后：请求不再声明该权益对应的工具**（其余权益、模型调用、DSH 本地工具不受影响；
    同名 DSH 本地工具会自动接管，见下），宿主日志提示一次并标明依据；
    `qwen_generate_image` 走 MCP 权益通道时按剩余张数拦住超量请求（n 太大直接报错，不扣钱），
-   额度耗尽则摘掉 ImageGeneration 服务、自动回落模型 API（开始花 Credits）。
+   额度耗尽则摘掉 TextGenerateImage 服务、自动回落模型 API（开始花 Credits）。
    周期重置或官网余额回升后自动恢复。
 5. 网关不可达（Cookie 失效/断网）时用 `tier` 配置或内置 standard 等级兜底，预算机制不失效。
 6. **为什么必须拦**：Harness 权益用尽后不会自动停，超出部分按目录价 88 折**后付费**
@@ -258,7 +258,7 @@ Node 的 `fetch` 默认**不读系统代理设置**，所以即使系统代理�
 额度耗尽的行置灰标橙并计入顶部警示。徽标悬浮提示列出各项「剩余/配额」摘要。
 **每行末尾带消耗来源标签**（v0.5.0 起）：绿色「权益」= 这次真在扣套餐单列的权益额度；
 黄色「Credits」= 这项还没走通 MCP，调用在花套餐 Credits。下方「权益通道」一行显示
-`已连通 n/6`；没配百炼按量付费 Key 时直接写明「现在每次调用都在花 Credits」并给出凭据名。
+`已连通 n/7`；没配百炼按量付费 Key 时直接写明「现在每次调用都在花 Credits」并给出凭据名。
 弹层交互仿模型切换器：无按钮，点徽标即打开并强制回源刷新，点弹层外任意处（透明遮罩）关闭，
 Esc 也可关闭。数据同源口径：套餐剩余 = 网关 `per1MonthPercentage` 取反，Credits 按月配额折算。
 数据走同源只读路由 `GET /qwen-token-plan-full/status`、`POST /qwen-token-plan-full/refresh`。
@@ -275,11 +275,26 @@ Esc 也可关闭。数据同源口径：套餐剩余 = 网关 `per1MonthPercenta
 
 | 服务 | 覆盖权益 | 抑制的服务端内置工具 |
 |---|---|---|
-| `WebSearch` | 联网搜索增强 + 垂类搜索 | `web_search` / `web_search_image` / `image_search` |
-| `WebParser` | 网页解析 | `web_extractor` |
+| `EnhancedSearch` | 联网搜索增强 | `web_search` |
+| `VerticalSearch` | 垂类搜索 | `web_search_image` / `image_search` |
+| `WebFetch` | 网页解析 | `web_extractor` |
 | `CodeInterpreter` | 代码解释器 | `code_interpreter` |
-| `TextToSpeech` / `SpeechToText` | 语音合成 / 语音识别 | 无（内置工具里没有对应项） |
-| `ImageGeneration` | 图像生成 | 无（`qwen_generate_image` 自己切通道） |
+| `TextGenerateSpeech` / `SpeechGenerateText` | 语音合成 / 语音识别 | 无（内置工具里没有对应项） |
+| `TextGenerateImage` | 图像生成 | 无（`qwen_generate_image` 自己切通道） |
+
+**服务名是实测出来的，不是照商店标题猜的**（v0.5.1 修正）。命名规律为「输入 Generate 输出」：
+`TextGenerateImage` / `TextGenerateSpeech` / `SpeechGenerateText` / `VideoGenerate`；
+搜索与抓取则是 `EnhancedSearch` / `VerticalSearch` / `WebFetch`。两种 404 必须分清：
+
+| 响应 | 含义 | 处置 |
+|---|---|---|
+| `404 MCP服务不存在` | **服务名写错了** | 改名字，不是权限问题 |
+| `404 未开通该MCP或非可用开通状态` | 名字对，账号未开通 | 去 MCP 广场开通 |
+
+v0.5.0 曾按商店标题写成 `ImageGeneration` / `WebSearch` / `WebParser` / `TextToSpeech` /
+`SpeechToText` / `VideoGeneration`，其中多数根本不存在，宿主会一直 `reconnecting`；
+`WebSearch` 虽存在却是另一个服务，且把增强搜索与垂类搜索错误地合并成一项额度。
+v0.5.1 起七项权益一一对应七个真实服务，实测全部 `connected`。
 
 - 端点 `${mcpHost}/api/v1/mcps/<Service>/mcp`（streamable-http）。鉴权头写
   `Bearer ${credential:BAILIAN_PAYG_API_KEY}` **模板**交宿主展开——明文 Key 不进配置、
@@ -292,7 +307,11 @@ Esc 也可关闭。数据同源口径：套餐剩余 = 网关 `per1MonthPercenta
 - **没配 Key 就整条通道不挂**：挂了也是 401，只会给模型塞一堆用不了的工具、给日志刷错误。
   此时面板每行标「Credits」并提示去哪配 Key。
 - 记账走 `tools.guard`：派发前乐观 +1（guard 拿不到成功与否），真实口径由控制台回源对齐。
-- 视频生成没有独立权益实例（按 Credits 计），默认不挂 `VideoGeneration`，
+- **官方余额不是实时的**：阿里云按量付费出账有 1–3 小时延迟（[官方说明](https://www.alibabacloud.com/help/zh/user-center/bill-solution-troubleshooting-manual-for-common-consumer-bill-questions)），
+  所以刚调用完控制台仍显示满额是正常现象，不代表没走权益通道。判断通道是否生效看
+  `status.mcp.servers[].state` 与生图返回的 `model` 前缀（`mcp:` = 走了权益通道），
+  别只看官方余额。本地乐观计数会先动，官方快照回源后再对齐。
+- 视频生成没有独立权益实例（按 Credits 计），默认不挂 `VideoGenerate`，
   以免与 `qwen_generate_video` 重复暴露同一能力。
 
 **`qwen_generate_image` 双通道**：MCP 就绪且还有权益余额 → 走 MCP（真扣那 20 张）；
@@ -340,6 +359,43 @@ Esc 也可关闭。数据同源口径：套餐剩余 = 网关 `per1MonthPercenta
 
 真实联网验证需单独进行；正常测试不会运行图片或视频生成。
 
+## v0.5.1（2026-11-23，MCP 服务名实测修正）
+
+v0.5.0 的 MCP 服务名是照百炼商店的**中文标题**推的英文名，拿到真实 `sk-ws-` Key 后逐个探测
+才发现多数根本不存在。这是本版唯一的实质缺陷，但它让整条权益通道形同虚设。
+
+**实测方法**：对 `<host>/api/v1/mcps/<name>/mcp` 发 JSON-RPC `initialize`，按响应区分：
+
+| 响应 | 含义 |
+|---|---|
+| `200` + `serverInfo.name="BaiLianMcpServer"` | 服务存在且账号可用 |
+| `404 MCP服务不存在` | **名字写错**（不是权限问题） |
+| `404 未开通该MCP或非可用开通状态` | 名字对、账号未开通 |
+
+**修正对照**（左为 v0.5.0 错名，右为实测真名）：
+
+| v0.5.0 | 实测结果 | v0.5.1 |
+|---|---|---|
+| `ImageGeneration` | 404 服务不存在 | `TextGenerateImage` |
+| `WebSearch` | 200，但是**另一个服务** | `EnhancedSearch`（增强搜索）+ `VerticalSearch`（垂类搜索） |
+| `WebParser` | 404 未开通 | `WebFetch` |
+| `TextToSpeech` | 404 服务不存在 | `TextGenerateSpeech` |
+| `SpeechToText` | 404 未开通 | `SpeechGenerateText` |
+| `VideoGeneration` | 404 服务不存在 | `VideoGenerate` |
+| `CodeInterpreter` | 200 ✓ | 不变 |
+
+命名规律是「输入 Generate 输出」。另外把默认 `mcpHost` 从千问 One Key 域名改为官方文档给的
+`https://dashscope.aliyuncs.com`（两域名对同一服务名返回一致，千问域名保留为 `MCP_HOSTS.qianwen`）。
+
+**连带修正**：增强搜索与垂类搜索是**两个独立服务、各有独立额度**，v0.5.0 把它们合并成一个
+`WebSearch` 会导致垂类搜索永远扣不到自己的额度、且任一项耗尽会误摘另一项。现在七项权益
+一一对应七个服务，`equityKeysOfService` 仍返回数组以备上游将来合并。
+
+**验证**：`npm test` 175 项全绿（服务数断言 6→7、搜索额度独立性、guard 分项记账均已改）；
+热重载后实测 7 个服务全部 `connected`、`equityChannels` 七项全 `equity`；
+真实调用 `qwen_generate_image` 返回 `model="mcp:bailian_image_gen"`，产物落盘正常。
+官方余额因按量付费出账延迟（1–3 小时）当时仍显示满额，属预期，见「已知边界」。
+
 ## v0.5.0（2026-11-23，Harness 权益 MCP 通道）
 
 **修的是一个计费口径错误，不是崩溃**：此前所有「权益」调用其实都在花套餐 Credits——
@@ -357,12 +413,12 @@ Token Plan 专属 Key（`sk-sp-`）只用于模型调用，Harness 权益必须�
 - `qwen_generate_image` 双通道：MCP 优先真扣权益，上游失败才回落模型 API；
   落盘失败不回落（避免同一张图收两次钱）；模型 API 分支不再记权益。
 - adapter 在声明服务端内置工具前剔除已被 MCP 接管的能力，且只认「真连通」的服务。
-- 面板每行加消耗来源标签（绿「权益」/黄「Credits」）+「权益通道 已连通 n/6」+ 缺 Key 提示。
+- 面板每行加消耗来源标签（绿「权益」/黄「Credits」）+「权益通道 已连通 n/7」+ 缺 Key 提示。
 
 **175 项离线回归全部通过**（新增 `mcp-equity` 13、`compat` +1）。新增用例专门盯住三件容易
 写错的事：缺 Key 时一个服务都不挂且面板如实说在花 Credits；注册了但连不上时既不摘内置工具
 也不标绿；额度耗尽摘服务的同时把内置工具还回去。热重载后实测 `status`：
-`mcp.reason="missing-key"`、6 个服务 `mounted:false`、7 项 `equityChannels` 全 `credits`
+`mcp.reason="missing-key"`、7 个服务 `mounted:false`、7 项 `equityChannels` 全 `credits`
 ——与「还没配 Key，所以现在确实在花 Credits」的事实一致。真实扣减待 Key 到位后验证。
 
 ## v0.4.3（2026-11-23，纯文本生图端点修复）

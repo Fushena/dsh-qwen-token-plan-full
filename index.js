@@ -39,7 +39,7 @@ export const Config = z.object({
     .description("百炼按量付费 Key（sk- / sk-ws-）的凭据名。配好后 7 项权益走 MCP：扣权益额度、不花 Credits；没配则一切照旧走模型 API 扣 Credits。"),
   // auto = 有 Key 就挂全部权益服务；off = 完全不挂；也可显式列服务名（逗号分隔）。
   mcpEquity: z.any().default("auto")
-    .description("权益 MCP 通道：auto（有 Key 就挂）/ off（不挂）/ 显式服务名列表，如 ImageGeneration,WebSearch。"),
+    .description("权益 MCP 通道：auto（有 Key 就挂）/ off（不挂）/ 显式服务名列表，如 TextGenerateImage,EnhancedSearch。"),
   mcpHost: z.string().default(MCP_HOSTS.cn)
     .description("MCP 服务基址。默认千问 AI 平台 One Key；百炼 DashScope 用 https://dashscope.aliyuncs.com。"),
   models: z.array(z.any()).default([]),

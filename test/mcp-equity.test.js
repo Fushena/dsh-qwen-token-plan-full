@@ -80,38 +80,42 @@ test('normalizeMcpMode accepts auto/off and an explicit service list, dropping u
   assert.deepEqual(normalizeMcpMode(true), { mode: 'auto' });
   assert.deepEqual(normalizeMcpMode(false), { mode: 'off' });
   assert.deepEqual(normalizeMcpMode('off'), { mode: 'off' });
-  assert.deepEqual(normalizeMcpMode('ImageGeneration, WebSearch'), { mode: 'list', services: ['ImageGeneration', 'WebSearch'] });
+  assert.deepEqual(normalizeMcpMode('TextGenerateImage, EnhancedSearch'), { mode: 'list', services: ['TextGenerateImage', 'EnhancedSearch'] });
   // 全是未知名字 → off，而不是「挂一堆不存在的服务」。
   assert.deepEqual(normalizeMcpMode('NoSuchService'), { mode: 'off' });
 });
 
 test('shouldMountService keeps unknown balances mounted and drops exhausted ones', () => {
   // 余额未知（网关兜底、还没回源）：先挂着让它试，真实 401 由宿主状态暴露。
-  assert.equal(shouldMountService('ImageGeneration', {}), true);
-  assert.equal(shouldMountService('ImageGeneration', { image_generation: { remaining: 3 } }), true);
-  assert.equal(shouldMountService('ImageGeneration', { image_generation: { remaining: 0 } }), false);
-  // WebSearch 服务两项权益共用：任一还有余额就该挂。
-  assert.equal(shouldMountService('WebSearch', { search_pro: { remaining: 0 }, vertical_search: { remaining: 5 } }), true);
-  assert.equal(shouldMountService('WebSearch', { search_pro: { remaining: 0 }, vertical_search: { remaining: 0 } }), false);
+  assert.equal(shouldMountService('TextGenerateImage', {}), true);
+  assert.equal(shouldMountService('TextGenerateImage', { image_generation: { remaining: 3 } }), true);
+  assert.equal(shouldMountService('TextGenerateImage', { image_generation: { remaining: 0 } }), false);
+  // 增强搜索与垂类搜索是**两个独立服务、各有独立额度**（实测确认），互不牵连。
+  assert.equal(shouldMountService('EnhancedSearch', { search_pro: { remaining: 0 }, vertical_search: { remaining: 5 } }), false);
+  assert.equal(shouldMountService('VerticalSearch', { search_pro: { remaining: 0 }, vertical_search: { remaining: 5 } }), true);
+  assert.equal(shouldMountService('EnhancedSearch', { search_pro: { remaining: 2 } }), true);
   // 视频没有权益实例，恒挂（不参与权益门控）。
   assert.equal(shouldMountService(VIDEO_MCP_SERVICE.service, {}), true);
 });
 
 test('suppressedBuiltins covers exactly the capabilities the mounted services provide', () => {
-  assert.deepEqual(suppressedBuiltins(['WebSearch']), ['web_search', 'web_search_image', 'image_search']);
-  assert.deepEqual(suppressedBuiltins(['WebParser']), ['web_extractor']);
+  assert.deepEqual(suppressedBuiltins(['EnhancedSearch']), ['web_search']);
+  assert.deepEqual(suppressedBuiltins(['VerticalSearch']), ['web_search_image', 'image_search']);
+  assert.deepEqual(suppressedBuiltins(['EnhancedSearch', 'VerticalSearch']), ['web_search', 'web_search_image', 'image_search']);
+  assert.deepEqual(suppressedBuiltins(['WebFetch']), ['web_extractor']);
   assert.deepEqual(suppressedBuiltins(['CodeInterpreter']), ['code_interpreter']);
   // 生图/语音没有对应的服务端内置工具，不该凭空抑制任何东西。
-  assert.deepEqual(suppressedBuiltins(['ImageGeneration', 'TextToSpeech']), []);
+  assert.deepEqual(suppressedBuiltins(['TextGenerateImage', 'TextGenerateSpeech']), []);
   assert.deepEqual(suppressedBuiltins([]), []);
 });
 
 test('serverOfToolName only recognises registered servers', () => {
-  assert.equal(serverOfToolName('mcp__WebSearch__search', ['WebSearch']), 'WebSearch');
-  assert.equal(serverOfToolName('mcp__Other__search', ['WebSearch']), undefined);
-  assert.equal(serverOfToolName('web_search', ['WebSearch']), undefined);
-  assert.equal(mcpToolPrefix('WebSearch'), 'mcp__WebSearch__');
-  assert.deepEqual(equityKeysOfService('WebSearch'), ['search_pro', 'vertical_search']);
+  assert.equal(serverOfToolName('mcp__EnhancedSearch__search', ['EnhancedSearch']), 'EnhancedSearch');
+  assert.equal(serverOfToolName('mcp__Other__search', ['EnhancedSearch']), undefined);
+  assert.equal(serverOfToolName('web_search', ['EnhancedSearch']), undefined);
+  assert.equal(mcpToolPrefix('EnhancedSearch'), 'mcp__EnhancedSearch__');
+  assert.deepEqual(equityKeysOfService('EnhancedSearch'), ['search_pro']);
+  assert.deepEqual(equityKeysOfService('VerticalSearch'), ['vertical_search']);
 });
 
 test('without a pay-as-you-go key nothing is mounted and the panel is told why', async () => {
@@ -132,18 +136,18 @@ test('without a pay-as-you-go key nothing is mounted and the panel is told why',
   mcp.dispose();
 });
 
-test('with a key all six benefit services mount with a credential template, never a literal key', async () => {
+test('with a key all seven benefit services mount with a credential template, never a literal key', async () => {
   const host = makeHost({ key: 'sk-fixture' });
   const mcp = registerEquityMcp(host.ctx, { apiKeyEnv: 'BAILIAN_PAYG_API_KEY', budget: budgetOf({ image_generation: 20 }) });
   await mcp.rearm();
   const mounted = mcp.mountedServices();
-  // 7 项权益 → 6 个服务（WebSearch 同时服务增强搜索与垂类搜索）；视频默认不挂。
-  assert.equal(mounted.length, 6);
-  assert.equal(new Set(EQUITY_MCP_SERVICES.map((i) => i.service)).size, 6);
+  // 7 项权益 → 7 个服务，一一对应（实测服务名，见 EQUITY_MCP_SERVICES 注释）；视频默认不挂。
+  assert.equal(mounted.length, 7);
+  assert.equal(new Set(EQUITY_MCP_SERVICES.map((i) => i.service)).size, 7);
   assert.ok(!mounted.includes(VIDEO_MCP_SERVICE.service), '视频无独立权益，默认不挂以免与 qwen_generate_video 重复');
-  const entry = host.registered.get('ImageGeneration').entry;
+  const entry = host.registered.get('TextGenerateImage').entry;
   assert.equal(entry.transport, 'streamable-http');
-  assert.equal(entry.url, `${MCP_HOSTS.cn}/api/v1/mcps/ImageGeneration/mcp`);
+  assert.equal(entry.url, `${MCP_HOSTS.cn}/api/v1/mcps/TextGenerateImage/mcp`);
   // 明文 Key 绝不进 entry：交宿主展开模板（manager 固定 expandTemplates:true）。
   assert.equal(entry.headers.Authorization, 'Bearer ${credential:BAILIAN_PAYG_API_KEY}');
   assert.ok(!JSON.stringify(entry).includes('sk-fixture'), 'entry 里不得出现明文 Key');
@@ -155,18 +159,18 @@ test('with a key all six benefit services mount with a credential template, neve
 test('exhausting a quota unmounts its service and hands the capability back to built-in tools', async () => {
   // 用户选定策略：MCP 优先，额度耗尽自动回落模型 API（开始花 Credits）。
   // 摘服务的同时必须让内置工具重新声明，否则该能力就整个消失了。
-  // webfetch 已耗尽 → WebParser 不挂，web_extractor 始终留在内置工具里，
-  // 好让本测试只观察 WebSearch 的挂/摘对 web_search 声明的影响。
+  // webfetch 已耗尽 → WebFetch 不挂，web_extractor 始终留在内置工具里，
+  // 好让本测试只观察 EnhancedSearch 的挂/摘对 web_search 声明的影响。
   const remaining = { search_pro: 1, vertical_search: 0, webfetch: 0, image_generation: 5 };
   const host = makeHost({ key: 'sk-fixture' });
   const mcp = registerEquityMcp(host.ctx, { budget: budgetOf(remaining) });
   await mcp.rearm();
-  assert.ok(mcp.readyServices().includes('WebSearch'));
+  assert.ok(mcp.readyServices().includes('EnhancedSearch'));
   assert.deepEqual(filterMcpShadowedBuiltins(['web_search', 'web_extractor'], mcp).tools, ['web_extractor']);
 
   remaining.search_pro = 0;
   mcp.refresh();
-  assert.ok(!mcp.mountedServices().includes('WebSearch'), '两项搜索权益都耗尽 → 摘 WebSearch');
+  assert.ok(!mcp.mountedServices().includes('EnhancedSearch'), '增强搜索额度耗尽 → 摘 EnhancedSearch');
   assert.deepEqual(filterMcpShadowedBuiltins(['web_search', 'web_extractor'], mcp).tools, ['web_search', 'web_extractor']);
   assert.equal(mcp.usesEquity('image_generation'), true, '生图还有余额，不受影响');
   assert.equal(equityChannel('search_pro', mcp.status()), 'credits');
@@ -175,11 +179,11 @@ test('exhausting a quota unmounts its service and hands the capability back to b
 
 test('a service that is registered but not connected neither shadows built-ins nor claims benefits', async () => {
   // 连不上（401/网络）却把内置工具摘了 = 把搜索能力整个弄丢；面板也不能谎报省钱。
-  const host = makeHost({ key: 'sk-fixture', states: { WebSearch: 'failed', ImageGeneration: 'connected' } });
+  const host = makeHost({ key: 'sk-fixture', states: { EnhancedSearch: 'failed', TextGenerateImage: 'connected' } });
   const mcp = registerEquityMcp(host.ctx, { budget: budgetOf({ search_pro: 10, image_generation: 10 }) });
   await mcp.rearm();
-  assert.ok(mcp.mountedServices().includes('WebSearch'), '注册仍在（宿主会自己重连）');
-  assert.ok(!mcp.readyServices().includes('WebSearch'), '但不算就绪');
+  assert.ok(mcp.mountedServices().includes('EnhancedSearch'), '注册仍在（宿主会自己重连）');
+  assert.ok(!mcp.readyServices().includes('EnhancedSearch'), '但不算就绪');
   assert.deepEqual(filterMcpShadowedBuiltins(['web_search'], mcp).tools, ['web_search']);
   assert.equal(equityChannel('search_pro', mcp.status()), 'credits');
   assert.equal(equityChannel('image_generation', mcp.status()), 'equity');
@@ -195,7 +199,7 @@ test('storing the key later mounts the channel without a restart', async () => {
   host.setKey('sk-later');
   host.emit('BAILIAN_PAYG_API_KEY');
   await mcp.rearm();
-  assert.ok(mcp.mountedServices().includes('ImageGeneration'));
+  assert.ok(mcp.mountedServices().includes('TextGenerateImage'));
   assert.equal(mcp.status().keyPresent, true);
   // 别的凭据更新不该触发重算。
   const before = host.calls.length;
@@ -212,8 +216,10 @@ test('the guard counts MCP dispatches optimistically and never rejects a call', 
   assert.equal(host.guards.length, 1);
   const guard = host.guards[0];
   // guard 在派发前运行、拿不到成功与否 → 只能乐观计数；口径由官方回源对齐。
-  assert.equal(guard({ tool: { name: 'mcp__WebSearch__search' } }), undefined);
-  assert.deepEqual(recorded, [['search_pro', 1], ['vertical_search', 1]], 'WebSearch 覆盖两项权益');
+  assert.equal(guard({ tool: { name: 'mcp__EnhancedSearch__search' } }), undefined);
+  assert.deepEqual(recorded, [['search_pro', 1]], '增强搜索只记自己那项额度');
+  assert.equal(guard({ tool: { name: 'mcp__VerticalSearch__image_search' } }), undefined);
+  assert.deepEqual(recorded, [['search_pro', 1], ['vertical_search', 1]], '垂类搜索记自己的额度');
   // 非 MCP 工具、未注册的服务都不记账，也一律放行。
   assert.equal(guard({ tool: { name: 'web_search' } }), undefined);
   assert.equal(guard({ tool: { name: 'mcp__Unknown__x' } }), undefined);
@@ -225,7 +231,7 @@ test('the guard counts MCP dispatches optimistically and never rejects a call', 
 test('callTool uses the host-adapted definition and its real schema instead of guessed names', async () => {
   const seen = [];
   const defs = [{
-    name: 'mcp__ImageGeneration__bailian_text_to_image',
+    name: 'mcp__TextGenerateImage__bailian_text_to_image',
     description: 'text to image',
     parameters: { type: 'object', properties: { prompt: { type: 'string' }, size: { type: 'string' } } },
     execute: async (args) => { seen.push(args); return { content: [{ type: 'text', text: 'ok' }] }; },
@@ -233,14 +239,14 @@ test('callTool uses the host-adapted definition and its real schema instead of g
   const host = makeHost({ key: 'sk-fixture', defs });
   const mcp = registerEquityMcp(host.ctx, { budget: budgetOf({ image_generation: 20 }) });
   await mcp.rearm();
-  const result = await mcp.callTool('ImageGeneration', {}, (candidates) => ({ rawName: candidates[0].name, definition: defs[0] }),
+  const result = await mcp.callTool('TextGenerateImage', {}, (candidates) => ({ rawName: candidates[0].name, definition: defs[0] }),
     (schema) => ({ prompt: 'p', ...(schema.properties.size ? { size: '1024*1024' } : {}) }));
   assert.equal(result.tool, 'bailian_text_to_image');
   assert.deepEqual(seen, [{ prompt: 'p', size: '1024*1024' }]);
-  assert.equal(mcp.status().servers.find((s) => s.service === 'ImageGeneration').lastTool, 'bailian_text_to_image');
+  assert.equal(mcp.status().servers.find((s) => s.service === 'TextGenerateImage').lastTool, 'bailian_text_to_image');
   // 工具还没同步过来时明确报「尚未就绪」，让调用方回落而不是静默失败。
   host.defs.length = 0;
-  await assert.rejects(mcp.callTool('ImageGeneration', {}, () => null, () => ({})), /尚未就绪/);
+  await assert.rejects(mcp.callTool('TextGenerateImage', {}, () => null, () => ({})), /尚未就绪/);
   mcp.dispose();
 });
 
@@ -249,7 +255,7 @@ test('off mode and a host without mcpManager degrade to credits without throwing
   assert.equal(off.status().enabled, false);
   assert.equal(off.usesEquity('image_generation'), false);
   assert.equal(equityChannel('image_generation', off.status()), 'credits');
-  await assert.rejects(off.callTool('ImageGeneration', {}, () => null, () => ({})), /未启用/);
+  await assert.rejects(off.callTool('TextGenerateImage', {}, () => null, () => ({})), /未启用/);
   off.dispose();
 
   const noManager = registerEquityMcp({ get: () => undefined }, {});
@@ -262,7 +268,7 @@ test('dispose unmounts every service and stays idempotent', async () => {
   const host = makeHost({ key: 'sk-fixture' });
   const mcp = registerEquityMcp(host.ctx, { budget: budgetOf({ image_generation: 20 }) });
   await mcp.rearm();
-  assert.equal(host.registered.size, 6);
+  assert.equal(host.registered.size, 7);
   mcp.dispose();
   assert.equal(host.registered.size, 0);
   mcp.dispose();
