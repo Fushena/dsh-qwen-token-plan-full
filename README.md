@@ -270,7 +270,7 @@ Esc 也可关闭。数据同源口径：套餐剩余 = 网关 `per1MonthPercenta
 
 ### 本地验证
 
-在插件目录执行 `npm test`（159 项：compat + relogin + stream + tier-retry + route-guard + model-display + catalog-feed + observer + capability-probe + config-knobs + stream-resilience + probe-integrity + media-safety + budget-merge，含媒体下载 SSRF/重定向、流内错误分类、探测完整性、跨实例预算合并回归）。runner 逐文件串行执行（Windows 上唯一全绿的组合，见 `test/run.mjs` 注释）。另有 `test/client-smoke.mjs` 单独跑（面板渲染桩，不在 runner 内）。
+在插件目录执行 `npm test`（161 项：compat + relogin + stream + tier-retry + route-guard + model-display + catalog-feed + observer + capability-probe + config-knobs + stream-resilience + probe-integrity + media-safety + budget-merge，含媒体下载 SSRF/重定向、流内错误分类、探测完整性、跨实例预算合并、纯文本生图端点回归）。runner 逐文件串行执行（Windows 上唯一全绿的组合，见 `test/run.mjs` 注释）。另有 `test/client-smoke.mjs` 单独跑（面板渲染桩，不在 runner 内）。
 `test/config-knobs.test.js` 钉死两个跨境旋钮与站点自动判定：默认值与最坏墙钟、非法值拒绝、
 `providerRetryPolicy` 真的把策略交给宿主、真实 HTTP 服务器上卡死的流在**配置的**阈值处报 TIMEOUT、
 国际站 key 自动切新加坡、断网不失活、换站点后媒体工具与目录一起跟随、
@@ -282,6 +282,34 @@ Esc 也可关闭。数据同源口径：套餐剩余 = 网关 `per1MonthPercenta
 测试使用本机已安装的 DeepSeek Harness 内置运行时与真实 `dsh-llm` 类，不访问网络、不读取个人凭据。其他安装路径可通过 `DSH_TEST_NODE` 和 `DSH_TEST_RUNTIME` 指定。
 
 真实联网验证需单独进行；正常测试不会运行图片或视频生成。
+
+## v0.4.3（2026-11-23，纯文本生图端点修复）
+
+`qwen_generate_image` 三个模型（qwen-image-3.0-pro / wan2.7-image / wan2.7-image-pro）
+**无参考图的纯文本生图一律 HTTP 400**：
+
+```
+Input should be 'user': input.messages.0.role &
+Input should be a valid list: input.messages.0.content &
+Input should be a valid list: input.messages.1.content
+```
+
+根因：旧实现把纯文本生图发到 compatible-mode `chat/completions`（OpenAI 形状
+`messages[].content=[{type:"text",text}]`），但图像模型在该网关按 DashScope **原生形状**校验
+（顶层 `messages` 被当成 `input.messages`，且 `content` 必须是原生 part 列表）。图生图分支本就
+走原生端点，所以只有「不带参考图」这条路径坏掉——恰好是最常用的路径。
+
+修复：两条分支统一到原生多模态端点
+`/api/v1/services/aigc/multimodal-generation/generation`，请求体
+`input.messages[0].content = [{text:prompt}]`（纯文本）或 `[{image:...},{text:prompt}]`（图生图）。
+`prompt_extend` 纯文本保留服务端默认（智能改写提升出图质量），图生图仍关闭（编辑指令逐字执行）。
+`size`/`n` 透传 `parameters` 不变；额度预检、逐张记账、下载 SSRF 防护均不受影响。
+
+验证：新增 `media-safety` T1/T2 两条端点回归（钉死原生端点 + `input.messages` 形状 + 不得再发
+compatible-mode + `prompt_extend` 默认），并修正 3 处旧 mock（`compat`、`config-knobs` ×2 原先
+打 `/chat` 是钉住了 bug 行为）。**161 项离线回归全部通过**（`media-safety` 22→24）。
+真实联网实测：修复后纯文本生图 HTTP 200 出图，旧 400 消失；经 HMR 热重载在运行中的 DSH 上
+用工具实跑确认（`set_plugin enabled=true` 触发 `reconcileProfile` 换掉旧 ESM 缓存，无需重启）。
 
 ## v0.4.2（2026-11-18，发布后审计整改）
 

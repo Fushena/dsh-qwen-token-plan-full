@@ -205,6 +205,47 @@ test("A-positive 合法 PNG 参考图正常走图生图（不破坏既有能力�
   });
 });
 
+// ───────────────────────── 纯文本生图端点回归（2026-11-23 修复）─────────────────────────
+// 旧实现把无参考图的生图发到 compatible-mode chat/completions（OpenAI 形状），图像模型
+// 一律 400（input.messages.*.role/content 校验）。修复后纯文本与图生图统一走原生多模态端点。
+
+test("T1 纯文本生图走原生多模态端点，请求体为 input.messages 原生形状", async (t) => {
+  await withTmpDir(async (dir) => {
+    fakeDns(t, PUBLIC_DNS);
+    const fetchImpl = capturingFetch((url) => (url.includes("multimodal-generation") ? imageJsonResponse() : okPngResponse()));
+    const ctx = makeCtx(dir);
+    registerMediaTools(ctx, makeOpts(fetchImpl));
+    const result = await ctx.defs[0].execute({ prompt: "一只胖鱼" }, exec());
+    assert.equal(result.count, 1);
+    const post = fetchImpl.calls.find((c) => c.init?.method === "POST");
+    assert.ok(post.url.includes("/api/v1/services/aigc/multimodal-generation/generation"), `纯文本生图必须走原生端点，实际：${post.url}`);
+    assert.ok(!post.url.includes("/chat/completions"), "不得再发 compatible-mode chat 端点");
+    const body = JSON.parse(post.init.body);
+    assert.equal(body.input.messages[0].role, "user");
+    assert.deepEqual(body.input.messages[0].content, [{ text: "一只胖鱼" }]);
+    assert.equal(body.messages, undefined, "不得用 OpenAI 顶层 messages 形状");
+    assert.equal(body.stream, undefined);
+    // 纯文本生图保留服务端 prompt_extend 默认（不显式关闭）。
+    assert.equal(body.parameters.prompt_extend, undefined);
+    assert.ok(result.paths[0].startsWith(dir));
+  });
+});
+
+test("T2 纯文本生图 size/n 透传到原生 parameters", async (t) => {
+  await withTmpDir(async (dir) => {
+    fakeDns(t, PUBLIC_DNS);
+    const fetchImpl = capturingFetch((url) => (url.includes("multimodal-generation") ? imageJsonResponse() : okPngResponse()));
+    const ctx = makeCtx(dir);
+    registerMediaTools(ctx, makeOpts(fetchImpl));
+    await ctx.defs[0].execute({ prompt: "p", size: "768*1152", n: 2 }, exec());
+    const post = fetchImpl.calls.find((c) => c.init?.method === "POST");
+    const body = JSON.parse(post.init.body);
+    assert.equal(body.parameters.size, "768*1152");
+    assert.equal(body.parameters.n, 2);
+    assert.deepEqual(body.input.messages[0].content, [{ text: "p" }]);
+  });
+});
+
 // ───────────────────────── 缺陷 D（P2）：先 stat 判大小/普通文件，再读 ─────────────────────────
 
 test("D1 超大参考图在读取前就被 stat 拒绝（不可读文件也能判大小）", async (t) => {

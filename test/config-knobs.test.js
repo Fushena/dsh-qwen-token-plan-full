@@ -259,7 +259,8 @@ test('换站点后媒体工具与目录一起跟随：不允许「对话切了�
     seen.push(href);
     if (href.includes('cn-beijing')) return new Response('{"code":"InvalidApiKey"}', { status: 401 });
     if (href.endsWith('/models')) return Response.json({ data: [{ id: 'qwen3.8-flash' }] });
-    if (href.includes('/chat/completions')) {
+    // 2026-11-23：纯文本生图统一走原生多模态端点（旧 mock 打 /chat/completions 钉住了 bug 行为）。
+    if (href.includes('/multimodal-generation/generation')) {
       return Response.json({
         choices: [{ message: { content: [{ type: 'image', image: 'https://example.com/cat.png' }] } }],
       });
@@ -369,7 +370,8 @@ test('观察-only（registerProvider=false）时媒体工具也要等站点判�
       if (href.includes('cn-beijing')) return new Response('{"code":"InvalidApiKey"}', { status: 401 });
       return Response.json({ data: [{ id: 'qwen3.8-flash' }] });
     }
-    if (href.includes('/chat/completions')) {
+    // 2026-11-23：纯文本生图统一走原生多模态端点（旧 mock 打 /chat/completions 钉住了 bug 行为）。
+    if (href.includes('/multimodal-generation/generation')) {
       imageHits.push(href);
       if (href.includes('cn-beijing')) return new Response('{"code":"InvalidApiKey"}', { status: 401 });
       return Response.json({ choices: [{ message: { content: [{ type: 'image', image: 'https://example.com/c.png' }] } }] });

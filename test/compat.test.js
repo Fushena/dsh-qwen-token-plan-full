@@ -349,7 +349,8 @@ test('image tool counts each downloaded image even when a later download fails',
     const budget={equityState:()=>({key:'image_generation',used:0,quota:20,remaining:20,unit:'张',source:'local'}),
       record:(key,count)=>{recorded.push([key,count]);return null;}};
     const dispose=registerMediaTools(ctx,{apiKeyEnv:'TEST',pluginName:'test',origin:'https://example.invalid',chatEndpoint:'https://example.invalid/chat',imageModels:['image'],videoModels:['video'],defaultImageModel:'image',defaultVideoModel:'video',budget,fetchImpl:async(url)=>{
-      if(String(url).endsWith('/chat'))return Response.json({choices:[{message:{content:[{type:'image',image:'https://example.invalid/a.png'},{type:'image',image:'https://example.invalid/b.png'}]}}]});
+      // 2026-11-23：纯文本生图也统一走原生多模态端点（旧 mock 打 /chat 是钉住了 bug 行为）。
+      if(String(url).includes('multimodal-generation'))return Response.json({choices:[{message:{content:[{type:'image',image:'https://example.invalid/a.png'},{type:'image',image:'https://example.invalid/b.png'}]}}]});
       if(String(url).endsWith('/b.png'))throw new Error('download boom');
       return new Response('x',{headers:{'content-type':'image/png'}});
     }});
