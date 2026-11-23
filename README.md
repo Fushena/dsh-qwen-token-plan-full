@@ -90,6 +90,7 @@ dsh plugin --profile <profile> add link:/绝对路径/dsh-qwen-token-plan-full
 | `bailianApiKeyEnv` | `BAILIAN_PAYG_API_KEY` | **百炼按量付费 Key** 的凭据引用名（`sk-`/`sk-ws-` 开头）。Harness 权益只认这把 key；Token Plan 专属 key（`sk-sp-`）打 MCP 一律 401，只会扣 Credits。没配就整条通道不挂，面板如实标「Credits」 |
 | `mcpEquity` | `auto` | 权益 MCP 通道：`auto` = 7 项权益一一对应 7 个真实服务；`off` 关闭；逗号列表按服务名精选（如 `TextGenerateImage,EnhancedSearch`）。视频无独立权益实例，默认不挂，要挂就显式写 `VideoGenerate` |
 | `mcpHost` | `https://dashscope.aliyuncs.com` | MCP 服务域名。千问 One Key 域名 `https://maas.qianwenaiapi.com` 亦可用，路径同为 `/api/v1/mcps/<Service>/mcp` |
+| `serviceQuotas` | `true` | 是否同时拉取**第一层「服务自带免费额度」**（官方先扣它）。关掉省两次控制台请求，面板退回只显示 Token Plan 权益的单层形态 |
 | `imageModels` / `videoModels` / `defaultImageModel` / `defaultVideoModel` | 见上 | 媒体工具可选模型 |
 | `models` | `[]` | 手工覆盖/追加目录条目（同 id 浅合并；可救活目录没有的模型） |
 | `excludeModels` | `[]` | 按 id 或前缀排除 |
@@ -310,10 +311,11 @@ v0.5.1 起七项权益一一对应七个真实服务，实测全部 `connected`�
   guard 收到的 `exec` 形状是 `{ name, callId, arguments, signal, … }`（宿主
   `dsh-tools/lib/pipeline.js` 的 `createExecution`），**没有 `exec.tool`**；按权益键记账，
   七个键在 `TOOL_TO_EQUITY` 里都有自映射（`tts`/`asr` 没有内置工具类型，只能走这条路）。
-- **官方余额不是实时的**：阿里云按量付费出账有 1–3 小时延迟（[官方说明](https://www.alibabacloud.com/help/zh/user-center/bill-solution-troubleshooting-manual-for-common-consumer-bill-questions)），
-  所以刚调用完控制台仍显示满额是正常现象，不代表没走权益通道。判断通道是否生效看
-  `status.mcp.servers[].state` 与生图返回的 `model` 前缀（`mcp:` = 走了权益通道），
-  别只看官方余额。本地乐观计数会先动，官方快照回源后再对齐。
+- **Token Plan 权益满格不代表没走通**：官方抵扣顺序是先扣「服务自带免费额度」，
+  那一层用完才动 Token Plan 附赠权益（见下一节）。另外阿里云按量付费出账有 1–3 小时延迟
+  （[官方说明](https://www.alibabacloud.com/help/zh/user-center/bill-solution-troubleshooting-manual-for-common-consumer-bill-questions)）。
+  判断通道是否生效看 `status.mcp.servers[].state` 与生图返回的 `model` 前缀
+  （`mcp:` = 走了权益通道），别只看某一层余额。本地乐观计数会先动，官方快照回源后再对齐。
 - 视频生成没有独立权益实例（按 Credits 计），默认不挂 `VideoGenerate`，
   以免与 `qwen_generate_video` 重复暴露同一能力。
 
@@ -321,6 +323,45 @@ v0.5.1 起七项权益一一对应七个真实服务，实测全部 `connected`�
 否则走模型 API（花 Credits）。上游调用失败才回落；**产物落盘失败直接报错、不回落**——
 权益已经扣掉了，再走一遍模型 API 等于同一张图收两次钱。上游工具名与参数按宿主同步来的
 真实 JSON Schema 匹配（不猜字段名），返回的 URL 与内联 base64 都能落盘。
+
+## 两层免费额度与「当前扣减」（v0.6.0 起）
+
+官方抵扣顺序（[Harness 权益文档](https://help.aliyun.com/zh/model-studio/token-plan-harness-benefits)常见问题原文）：
+
+> 先抵扣对应服务本身的免费额度（如各产品自带的试用/新用户额度），再抵扣 Token Plan
+> 附赠的权益额度；权益额度用尽后，超出部分按对应服务的折扣价继续按量计费。
+
+所以**有三层，钱按顺序往下走**：
+
+| 层 | 是什么 | 周期 | 数据来源 |
+|---|---|---|---|
+| ① 服务自带免费额度 | 各 MCP 服务自己的试用额度（图像 100 张、搜索 200 次、TTS 1 万字符…） | 账号级，**有独立到期日**（实测 12/2、12/4） | `freetier/ListBailianFreetier` → `BssOpenAPI-V3/DescribeFqInstance` |
+| ② Token Plan 附赠权益 | 套餐给的那 20 张 / 100 次 | 跟订阅周期（每月） | `queryTokenPlanEquityInfo` |
+| ③ 88 折按量后付费 | 两层用尽后的超出部分 | 走账单，**真花钱** | — |
+
+**v0.5.x 的显示缺陷**：面板只读第②层。2026-11-23 实测调了 MCP 生图/搜索/TTS，
+第①层各扣 1 张 / 1 次 / 33 字符，第②层七项纹丝不动（20/20 满格）——用户据此判定
+「通道没生效」。这是显示缺陷，不是计费缺陷。v0.6.0 起两层并列显示，每行标出此刻在扣哪一层。
+
+- 面板两个小节：**服务自带免费额度**（右挂自己的到期日）+ **Token Plan 附赠权益**
+  （右挂订阅周期重置日）。顶部一行「当前扣减」用一句话讲清钱从哪出。
+- 每行标签四态：`服务额度`（蓝）/ `套餐权益`（绿）/ `按量付费`（红）/ `Credits`（黄，走模型 API）。
+  **标签只标此刻真在扣的那一层**：第一层在扣时第二层不挂标签——两层都挂会让满格的套餐权益
+  看着像正在被消耗，那正是这一版要消除的误读。
+  由 `status.chargeSources` 给出——它把**通道**（MCP 还是模型 API）与**扣减层**合成结论，
+  两者正交：走模型 API 时无论哪层有余额，花的都是 Credits。
+- **第①层不参与工具拦截**。它耗尽只意味着开始扣第②层，能力并没有断；拿它去摘工具会把
+  还能用的能力误停。只有第②层耗尽才停用内置工具声明（`filterTools` 口径不变）。
+- 第①层数据缺失时**不假定它还有余量**：宁可显示第②层，也不谎报「在扣免费额度」。
+  已到期 / 快照超新鲜度 / 时钟回拨一律判不可用，面板给可操作提示而不是画空表。
+- 单位一律用 `BaseValue` 归一（字符/秒），**不用上游 `ShowUnit`**：语音合成的
+  `InitCapacity.ShowUnit` 是「万字」而 `CurrCapacity.ShowUnit` 是「word」，两边口径不一致。
+  `EndTime` 形如 `Wed Dec 02 00:00:00 CST 2026`，V8 把 `CST` 当美国中部（−06:00），
+  必须替换成 `GMT+0800` 再解析，否则到期时间错开 14 小时。
+- 视频只在第①层有额度（10 秒试用），第②层没有独立实例：第①层显示真实余量，
+  第②层仍显示「✓ 包含」。不足 1 分钟的秒级额度按秒显示，避免被四舍五入成「0h/0h」。
+- 第①层是账号级试用额度，**不随订阅周期清零**；跨实例合并时两层各自比新鲜度
+  （来自不同接口，任一层失败不该让另一层的快照作废）。
 
 ## 未知新模型的推断规格
 
@@ -337,6 +378,10 @@ v0.5.1 起七项权益一一对应七个真实服务，实测全部 `connected`�
 - MCP 记账是**派发前乐观计数**（`tools.guard` 拿不到成功与否），失败调用也会先 +1；
   真实口径以控制台回源为准（默认 15 分钟新鲜度）。
 - MCP 生图暂不支持本地参考图（`referenceImage`）：带参考图时直接走模型 API。
+- **第①层「服务自带免费额度」需要控制台 Cookie**（与权益余额同一登录态）。Cookie 失效时
+  这一层显示为不可用并提示重试，第②层照常显示；`serviceQuotas:false` 可完全关掉这一层取数。
+- 第①层的到期日是**账号级试用额度的终点**，与订阅周期无关；到期后该项自动判不可用，
+  扣减层随之落到第②层或按量付费。
 
 ## 与 DSH 0.2.1-rc.5 的兼容修复（插件 0.2.1）
 
@@ -349,7 +394,10 @@ v0.5.1 起七项权益一一对应七个真实服务，实测全部 `connected`�
 
 ### 本地验证
 
-在插件目录执行 `npm test`（176 项：compat + relogin + stream + tier-retry + route-guard + model-display + catalog-feed + observer + capability-probe + config-knobs + stream-resilience + probe-integrity + media-safety + budget-merge + mcp-equity，含媒体下载 SSRF/重定向、流内错误分类、探测完整性、跨实例预算合并、纯文本生图端点回归、MCP 权益通道挂/摘与双通道计费口径）。runner 逐文件串行执行（Windows 上唯一全绿的组合，见 `test/run.mjs` 注释）。另有 `test/client-smoke.mjs` 单独跑（面板渲染桩，不在 runner 内；含 v0.5.0 的来源标签与权益通道断言：缺 Key 时全标 Credits 且给出凭据名、连通项标绿、未连通项仍标 Credits、无 mcpManager 时说明原因）。
+在插件目录执行 `npm test`（185 项：compat + relogin + stream + tier-retry + route-guard + model-display + catalog-feed + observer + capability-probe + config-knobs + stream-resilience + probe-integrity + media-safety + budget-merge + mcp-equity + quota-layers，含媒体下载 SSRF/重定向、流内错误分类、探测完整性、跨实例预算合并、纯文本生图端点回归、MCP 权益通道挂/摘与双通道计费口径、两层额度与扣减层判定）。runner 逐文件串行执行（Windows 上唯一全绿的组合，见 `test/run.mjs` 注释）。另有 `test/client-smoke.mjs` 单独跑（面板渲染桩，不在 runner 内；含来源标签与权益通道断言：缺 Key 时全标 Credits 且给出凭据名、连通项按扣减层标注、无 mcpManager 时说明原因；以及 v0.6.0 的两层断言：两小节并列且顺序与抵扣顺序一致、两层各自的真实数字、第一层耗尽转标套餐权益、第一层缺数据时不谎报、视频 10 秒试用按秒显示）。
+
+下载类用例把 DNS 钉在 mock 上（`pinPublicDns`）：本机 DNS 会把 `*.invalid` 泛解析到
+`198.18.x.x`（RFC 2544 基准段，属 SSRF 闸的内网地址），不钉死就会随网络环境随机失败。
 `test/config-knobs.test.js` 钉死两个跨境旋钮与站点自动判定：默认值与最坏墙钟、非法值拒绝、
 `providerRetryPolicy` 真的把策略交给宿主、真实 HTTP 服务器上卡死的流在**配置的**阈值处报 TIMEOUT、
 国际站 key 自动切新加坡、断网不失活、换站点后媒体工具与目录一起跟随、
@@ -361,6 +409,44 @@ v0.5.1 起七项权益一一对应七个真实服务，实测全部 `connected`�
 测试使用本机已安装的 DeepSeek Harness 内置运行时与真实 `dsh-llm` 类，不访问网络、不读取个人凭据。其他安装路径可通过 `DSH_TEST_NODE` 和 `DSH_TEST_RUNTIME` 指定。
 
 真实联网验证需单独进行；正常测试不会运行图片或视频生成。
+
+## v0.6.0（2026-11-23，两层免费额度与「当前扣减」）
+
+**这不是 bug 修复，是把一个显示缺陷补上——它此前让用户以为整条权益通道没生效。**
+
+实测经过：拿到真实 Key、七个服务全部 `connected`、生图返回 `mcp:bailian_image_gen`，
+但 Token Plan 权益七项纹丝不动（图像 20/20 满格）。第一反应是「出账延迟 1–3 小时」，
+等了近两小时复查仍然全满——那个归因是错的。继续挖控制台前端才找到真相：
+**官方先扣「服务自带免费额度」，那一层用完才动 Token Plan 附赠权益。**
+同一时刻第①层的实测数字正好对上我们的调用：图像 99/100（扣 1 张）、
+语音合成 9967/10000（扣 33 字符）、联网搜索 199/200（扣 1 次）。
+
+取数链路是从 `benefits.js` 里挖出来的，不是猜的：
+`freetier/ListBailianFreetier{CommodityList:["sfm_plugin_public_cn"]}` 拿模板码 →
+`BssOpenAPI-V3/DescribeFqInstance{TemplateCodes}` 拿 `InitCapacity`/`CurrCapacity`，
+已用 = 两者 `BaseValue` 相减。此前猜过的十几个接口名全部 `NotFound`。
+
+改动：
+
+- `lib/gateway.js` 新增 `fetchServiceQuotas`（八项映射，含视频 10 秒试用），
+  `Status==="valid"` 才算可用；单位用 `BaseValue` 不用 `ShowUnit`；
+  `EndTime` 的 `CST` 换成 `GMT+0800` 再解析（否则错 14 小时）。
+- `lib/budget.js` 新增第一层快照落盘、`serviceQuotaState`、`chargeLayer` 四态判定，
+  跨实例合并时两层各自比新鲜度，第一层不随订阅周期清零。
+- `index.js` 新增 `serviceQuotas` 开关与并行回源，status 输出
+  `serviceQuotas`/`chargeLayers`/`chargeSources`（通道 × 扣减层的合成结论）。
+- `lib/client.js` 面板改成两个小节并列 + 每行四态标签 + 顶部「当前扣减」一句话。
+- **第一层耗尽不停用工具**：它只意味着开始扣第二层，能力没断。
+- 视频只在第一层有额度，`chargeSources` 对它按层判定而非一律标 Credits。
+
+**验证**：`npm test` 185 项全绿（新增 `quota-layers` 9）；`client-smoke` 覆盖两层并列、
+第一层耗尽转标套餐权益、第一层缺数据不谎报、视频按秒显示；热重载后实测 status 出两层
+真实数字（第一层三项已扣、第二层七项满格）、八项 `chargeSources` 全 `service`；
+面板 bundle 经 combo 地址取回 200，含两小节标题与「当前扣减」。
+
+另修两处**既有**测试对本机 DNS 的隐式依赖（`*.invalid` 被泛解析到 `198.18.x.x`，
+落进 SSRF 闸的内网段）：`compat` 与 `route-guard` 的下载用例改为把 DNS 钉在 mock 上。
+已在 HEAD 副本复跑确认这两个失败与本版改动无关。
 
 ## v0.5.2（2026-11-23，MCP 服务名实测修正 + 权益记账漏映射）
 

@@ -59,11 +59,37 @@ const COUNTS = [
   { key: 'asr', quota: 18000, used: 3600, remaining: 14400, unit: '秒' },
   { key: 'image_generation', quota: 20, used: 6, remaining: 14, unit: '张' },
 ];
+// 第一层「服务自带免费额度」（官方先扣这一层）。数值刻意与第二层不同，
+// 这样断言能证明两层各自渲染、没有把同一个数字画两遍。
+const SERVICE = [
+  { key: 'search_pro', quota: 200, used: 1, remaining: 199, unit: '次', expiresAt: 1796400000000 },
+  { key: 'vertical_search', quota: 200, used: 0, remaining: 200, unit: '次', expiresAt: 1796400000000 },
+  { key: 'webfetch', quota: 1000, used: 0, remaining: 1000, unit: '次', expiresAt: 1796400000000 },
+  { key: 'code_interpreter', quota: 500, used: 0, remaining: 500, unit: '次', expiresAt: 1796227200000 },
+  { key: 'tts', quota: 10000, used: 33, remaining: 9967, unit: '字符', expiresAt: 1796227200000 },
+  { key: 'asr', quota: 36000, used: 0, remaining: 36000, unit: '秒', expiresAt: 1796227200000 },
+  { key: 'image_generation', quota: 100, used: 1, remaining: 99, unit: '张', expiresAt: 1796227200000 },
+  { key: 'video_generation', quota: 10, used: 0, remaining: 10, unit: '秒', expiresAt: 1796227200000 },
+];
 const STATUS = {
   enabled: true,
   tier: { specCode: 'standard', monthlyCredits: 45000, fiveHourCredits: 3000, planUsagePercent: 58, resetTime: 1795363200000, remainingDays: 19, source: 'gateway' },
   equityCounts: COUNTS,
   equities: null,
+  serviceQuotas: SERVICE,
+  serviceQuotasFetchedAt: Date.now(),
+  // 宿主判定：七项里 code_interpreter 的第二层已耗尽且第一层也耗尽 → paid；
+  // 其余项第一层还有余量 → service（官方先扣它，第二层满格属正常）。
+  chargeLayers: {
+    search_pro: 'service', vertical_search: 'service', webfetch: 'service',
+    code_interpreter: 'paid', tts: 'service', asr: 'service',
+    image_generation: 'service', video_generation: 'service',
+  },
+  chargeSources: {
+    search_pro: 'service', vertical_search: 'service', webfetch: 'service',
+    code_interpreter: 'paid', tts: 'service', asr: 'service',
+    image_generation: 'service', video_generation: 'service',
+  },
   caps: { specCode: 'standard' },
   usage: { totalCalls: 111, periodAnchor: 1795363200000 },
   paused: { any: true, reason: 'equity', exhausted: [{ key: 'code_interpreter', used: 100, quota: 100, unit: '次' }], until: 1795363200000 },
@@ -160,6 +186,8 @@ assert.ok(calmJson.includes('⚡ 权益'), '未耗尽时徽标显示「⚡ 权�
 // 缺 Key 时必须如实说在花 Credits，不能因为权益满格就让人以为在省钱。
 const noKey = structuredClone(STATUS);
 noKey.equityChannels = Object.fromEntries(COUNTS.map((c) => [c.key, 'credits']));
+// 宿主把「通道」与「扣减层」合成 chargeSources：走模型 API 时无论哪层有余额都花 Credits。
+noKey.chargeSources = Object.fromEntries(Object.keys(noKey.chargeSources).map((k) => [k, 'credits']));
 noKey.mcp = {
   enabled: true, reason: 'missing-key', keyPresent: false,
   host: 'https://dashscope.aliyuncs.com', credentialRef: 'BAILIAN_PAYG_API_KEY',
@@ -175,6 +203,8 @@ assert.ok(noKeyJson.includes('现在每次调用都在花 Credits'), '缺 Key �
 // MCP 连通：对应项标绿「权益」，未接通的项仍标「Credits」。
 const connected = structuredClone(noKey);
 connected.equityChannels = { ...connected.equityChannels, image_generation: 'equity', search_pro: 'equity' };
+// 走 MCP 的两项：第一层还有余量 → service；其余仍走模型 API → credits。
+connected.chargeSources = { ...connected.chargeSources, image_generation: 'service', search_pro: 'service' };
 connected.mcp = {
   enabled: true, reason: 'mounted', keyPresent: true,
   host: 'https://dashscope.aliyuncs.com', credentialRef: 'BAILIAN_PAYG_API_KEY',
@@ -185,12 +215,64 @@ connected.mcp = {
   ],
 };
 const connectedJson = renderWith('budget', connected);
-assert.ok(connectedJson.includes('qtpf-src equity'), 'MCP 连通的项标绿「权益」');
+assert.ok(connectedJson.includes('qtpf-src service'), 'MCP 连通且第一层有余量的项标「服务额度」');
 assert.ok(connectedJson.includes('qtpf-src credits'), '未接通的项仍标「Credits」');
 assert.ok(connectedJson.includes('权益通道'), '面板含「权益通道」状态行');
 assert.ok(connectedJson.includes('2/3'), '权益通道显示已连通数/总数');
 assert.ok(connectedJson.includes('自动回落模型 API'), '有服务因额度耗尽摘除时说明已回落');
 assert.ok(!connectedJson.includes('未配置百炼按量付费 Key'), '有 Key 时不再提示缺 Key');
+
+// —— v0.6.0：两层额度并列 + 「当前扣减」标注 ——
+// 用户 2026-11-23 明确要求：只报第二层会让人看着「20/20 满格」以为调用没走通，
+// 实际钱扣在第一层「服务自带免费额度」。两层必须同时可见。
+const layersJson = renderWith('budget');
+const layersPanel = layersJson.slice(layersJson.indexOf('qtpf-panel'));
+assert.ok(layersPanel.includes('服务自带免费额度'), '面板含第一层小节标题');
+assert.ok(layersPanel.includes('Token Plan 附赠权益'), '面板含第二层小节标题');
+assert.ok(layersPanel.indexOf('服务自带免费额度') < layersPanel.indexOf('Token Plan 附赠权益'), '第一层在第二层之前（抵扣顺序一致）');
+// 两层各自的真实数字，证明不是把同一个值画两遍。
+assert.ok(layersPanel.includes('99/100张'), '第一层图像 99/100（已扣 1）');
+assert.ok(layersPanel.includes('14/20张'), '第二层图像 14/20（与第一层不同）');
+assert.ok(layersPanel.includes('199/200次'), '第一层搜索 199/200');
+assert.ok(layersPanel.includes('9967/1万字符'), '第一层语音合成 9967/1万字符');
+assert.ok(layersPanel.includes('10h/10h'), '第一层语音识别 36000 秒 → 10h/10h');
+assert.ok(layersPanel.includes('qtpf-src service'), '第一层有余量的项标「服务额度」');
+assert.ok(layersPanel.includes('qtpf-src paid'), '两层都耗尽的项标「按量付费」');
+assert.ok(layersPanel.includes('当前扣减'), '面板顶部有「当前扣减」提示行');
+assert.ok(layersPanel.includes('官方先扣服务自带免费额度'), '点明抵扣顺序，解释第二层为何满格');
+assert.ok(layersPanel.includes('服务额度到期'), '第一层标注自己的到期日（与订阅周期不同）');
+assert.ok(layersPanel.includes('周期重置'), '第二层标注订阅周期重置日');
+// 视频：第二层无独立实例（✓ 包含），但第一层有 10 秒试用，必须显示真实余量。
+assert.ok(layersPanel.includes('10/10秒'), '视频第一层 10 秒试用按秒显示（不被抹成 0h）');
+assert.ok(layersPanel.includes('✓ 包含'), '视频第二层仍回退静态文案');
+// 标签只标真在扣的那一层：第一层在扣时，第二层不得也挂「服务额度」——
+// 否则满格的套餐权益看着像正在被消耗，正是这一版要消除的误读。
+const planSegment = layersPanel.slice(layersPanel.indexOf('Token Plan 附赠权益'));
+assert.ok(!planSegment.includes('qtpf-src service'), '第一层在扣时第二层不挂「服务额度」标签');
+assert.ok(planSegment.includes('qtpf-src paid'), '两层都耗尽的项仍在第二层标「按量付费」');
+
+// 第一层耗尽 → 该行标「套餐权益」，顶部提示改为「现在扣套餐权益」。
+const serviceOut = structuredClone(STATUS);
+serviceOut.serviceQuotas = SERVICE.map((row) => ({ ...row, used: row.quota, remaining: 0 }));
+serviceOut.chargeSources = Object.fromEntries(Object.keys(serviceOut.chargeSources).map((k) => [k, 'equity']));
+const serviceOutJson = renderWith('budget', serviceOut);
+const serviceOutPanel = serviceOutJson.slice(serviceOutJson.indexOf('qtpf-panel'));
+assert.ok(serviceOutPanel.includes('qtpf-src equity'), '第一层耗尽后标「套餐权益」');
+assert.ok(serviceOutPanel.includes('现在扣的是套餐附赠权益'), '提示改为正在扣第二层');
+assert.ok(!serviceOutPanel.includes('官方先扣服务自带免费额度'), '第一层耗尽后不再说「先扣服务额度」');
+assert.ok(serviceOutPanel.includes('0/100张'), '第一层耗尽行显示 0');
+
+// 第一层取数失败：不画空表，给可操作提示，第二层照常显示（能力没断）。
+const noService = structuredClone(STATUS);
+noService.serviceQuotas = [];
+delete noService.chargeSources;
+delete noService.chargeLayers;
+const noServiceJson = renderWith('budget', noService);
+const noServicePanel = noServiceJson.slice(noServiceJson.indexOf('qtpf-panel'));
+assert.ok(noServicePanel.includes('服务自带额度暂不可用'), '第一层无数据时给出提示');
+assert.ok(noServicePanel.includes('14/20张'), '第一层缺失时第二层仍完整显示');
+assert.ok(!noServicePanel.includes('qtpf-src service'), '无第一层数据时不谎报在扣服务额度');
+assert.ok(!noServicePanel.includes('当前扣减'), '两层都无判定依据时不显示扣减提示');
 
 // 宿主没有 mcpManager：说明原因，而不是静默什么都不显示。
 const noManager = structuredClone(STATUS);

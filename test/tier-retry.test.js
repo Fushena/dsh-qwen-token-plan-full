@@ -56,7 +56,10 @@ test('tier fallback retry is one-shot: repeated failures never reschedule the 60
     await flush();
     const retrySchedules = () => timeouts.filter((entry) => entry.ms === 60_000);
     assert.equal(retrySchedules().length, 1, '首次失败应排且只排一个 60s 兜底重试');
-    assert.equal(fetchCalls, 3, '启动即取 catalog/tier/equity 各一次（显式 endpoint 不做站点探测）');
+    // 启动 4 次：catalog / tier / 第二层权益 / 第一层服务自带额度（v0.6.0 起两层都拉）。
+    // 第一层自身还要两跳（freetier 取模板码 → DescribeFqInstance 取余量），但第一跳就失败，
+    // 所以只多 1 次。显式 endpoint 不做站点探测，计数才干净。
+    assert.equal(fetchCalls, 4, '启动即取 catalog/tier/权益/服务额度各一次（显式 endpoint 不做站点探测）');
 
     // 推进第一个 60s：重试仍失败（fetch 恒 reject）。一次性语义 → 不得再排。
     retrySchedules()[0].fn();
@@ -67,7 +70,7 @@ test('tier fallback retry is one-shot: repeated failures never reschedule the 60
     retrySchedules()[0].fn();
     await flush();
     assert.equal(retrySchedules().length, 1, '持续失败时 60s 排程恒为 1');
-    assert.equal(fetchCalls, 5, 'fetch 次数 = 启动 3 次 + 实际触发的重试 2 次，有界');
+    assert.equal(fetchCalls, 6, 'fetch 次数 = 启动 4 次 + 实际触发的重试 2 次，有界');
     // 每次失败都 setTierFallback→#save：写盘次数同样以「失败次数」为上界，不随时间无限增长。
     const budgetFile = path.join(home, '.dsh', 'qwen-token-plan-full.budget.json');
     assert.equal(fs.existsSync(budgetFile), true, '兜底等级应已落盘');

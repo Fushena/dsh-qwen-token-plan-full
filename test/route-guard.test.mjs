@@ -4,6 +4,7 @@ import { readFileSync, mkdtempSync, rmSync } from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
+import dns from 'node:dns';
 import { trustedRouteRequest, isLoopbackHostname, hostnameOf } from '../lib/route-guard.js';
 import { download, assertDownloadUrl, isPrivateHostLiteral } from '../lib/media-tools.js';
 
@@ -11,6 +12,25 @@ import { download, assertDownloadUrl, isPrivateHostLiteral } from '../lib/media-
 // 旧守卫把 Origin 与 Host 自比 → DNS rebinding 直接 200。
 const BIND = '127.0.0.1'; // ctx.get("webServer").host 的典型值
 const req = (headers) => ({ headers });
+
+/**
+ * 下载类用例必须把 DNS 钉死在 mock 上，否则结果随本机网络环境变化。
+ *
+ * 实测教训（2026-11-23）：本机 DNS 把 *.invalid 泛解析到 198.18.x.x（RFC 2544 基准段，
+ * 属 SSRF 闸的内网地址），于是下载用例报「拒绝下载本机/内网地址的生成结果」而失败——
+ * 代码没问题，是测试依赖了真实解析。这里让夹具域名解析到公网地址：
+ * fetch 仍是假的/只打回环服务器，既保持离线，又让 SSRF 闸走它该走的放行分支。
+ * 未列入的域名一律 ENOTFOUND，避免夹具悄悄打到真实网络。
+ */
+const PINNED_PUBLIC_HOSTS = new Set(['example.invalid', 'cdn.example.invalid']);
+function pinPublicDns(t) {
+  t.mock.method(dns.promises, 'lookup', async (host) => {
+    if (!PINNED_PUBLIC_HOSTS.has(String(host).toLowerCase())) {
+      throw Object.assign(new Error(`getaddrinfo ENOTFOUND ${host}`), { code: 'ENOTFOUND' });
+    }
+    return [{ address: '93.184.216.34', family: 4 }];
+  });
+}
 
 test('route guard: loopback and bind hosts are allowed', () => {
   assert.equal(trustedRouteRequest(req({ host: '127.0.0.1:49419' }), BIND), true, '① 127.0.0.1 无其他头');
@@ -117,7 +137,8 @@ test('route guard: garbage hosts are rejected', () => {
   assert.equal(hostnameOf('http://evil.example:49419'), 'evil.example');
 });
 
-test('media download: non-https, private, and oversized results are refused', async () => {
+test('media download: non-https, private, and oversized results are refused', async (t) => {
+  pinPublicDns(t);
   // 下载产物必须落在临时目录：这个用例真的会写文件，不能污染 test/。
   const dir = mkdtempSync(path.join(os.tmpdir(), 'qtpf-dl-'));
   const okFetch = async () => new Response('x', { headers: { 'content-type': 'image/png' } });
@@ -178,7 +199,8 @@ test('media download: IPv6 private literals (mapped / ULA / link-local) are refu
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('media download: redirects are re-validated hop by hop (302 to loopback is refused)', async () => {
+test('media download: redirects are re-validated hop by hop (302 to loopback is refused)', async (t) => {
+  pinPublicDns(t);
   // 回归（2026-11-13 审计）：旧 download 用默认 redirect:follow，上游 302 →
   // http://127.0.0.1/… 时校验只在第一跳做过，内网响应体被直接读走。
   // 这里用真实 fetch（undici 默认跟随重定向）+ 回环服务器模拟被投毒的上游：

@@ -1,4 +1,5 @@
 import { readFileSync, writeFileSync, mkdtempSync, rmSync, readdirSync, existsSync } from 'node:fs';
+import dns from 'node:dns';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -22,6 +23,24 @@ const opts = (extra = {}) => ({ model: qwen.id, messages: [], tools: [], ...extr
 function sse(events) { return new Response(events.map(e => `data: ${JSON.stringify(e)}\r\n\r\n`).join('')).body; }
 async function collect(stream) { const chunks=[]; for await(const c of stream) chunks.push(c); return chunks; }
 function assemble(chunks) { const a=new BlockAssembler(); for(const c of chunks) a.push(c); return a; }
+
+/**
+ * 下载类测试必须把 DNS 钉死在 mock 上，否则结果随本机网络环境变化。
+ *
+ * 实测教训（2026-11-23）：本机 DNS 把 *.invalid 泛解析到 198.18.x.x（RFC 2544 基准段，
+ * 属 SSRF 闸的内网地址），于是四个下载测试报「拒绝下载本机/内网地址的生成结果」而失败——
+ * 代码没问题，是测试依赖了真实解析。这里让夹具域名解析到公网地址，
+ * 既保持离线（fetch 仍是假的），又让 SSRF 闸走它该走的放行分支。
+ */
+const PINNED_PUBLIC_HOSTS = new Set(['example.invalid']);
+function pinPublicDns(t) {
+  t.mock.method(dns.promises, 'lookup', async (host) => {
+    if (!PINNED_PUBLIC_HOSTS.has(String(host).toLowerCase())) {
+      throw Object.assign(new Error(`getaddrinfo ENOTFOUND ${host}`), { code: 'ENOTFOUND' });
+    }
+    return [{ address: '93.184.216.34', family: 4 }];
+  });
+}
 
 test('DSH loader receives a Config schema and the credential-ref field', () => {
   assert.equal(plugin.Config, Config);
@@ -275,7 +294,8 @@ test('adapter request timeout and network failures become retryable codes',async
   assert.equal(new QwenTokenPlanAdapter({...base,fetchImpl:async()=>new Response('')}).requestTimeoutMs,60_000);
 });
 
-test('video tool forwards duration and clamps invalid values',async()=>{
+test('video tool forwards duration and clamps invalid values',async(t)=>{
+  pinPublicDns(t);
   // 产物必须落在本例自己的临时目录：这条用例真的会下载三次视频。原先写死 '/tmp'，
   // 每跑一次测试就在系统临时目录里留三个文件（实测累积到 126 个），既污染 /tmp
   // 又让「测试不留残留」这条卫生要求形同虚设。
@@ -323,7 +343,8 @@ function fakeMcp({state,images=['https://example.invalid/a.png'],schema,calls=[]
   };
 }
 
-test('image tool gates n against remaining entitlement on the MCP channel',async()=>{
+test('image tool gates n against remaining entitlement on the MCP channel',async(t)=>{
+  pinPublicDns(t);
   // 权益通道上「剩 1 张却请求 n=4」必须在调用上游之前就被拒（回归：旧实现只判
   // remaining<=0，于是剩 1 张仍一次生成 4 张，多出的按套餐外 88 折后付费）。
   // 2026-11-23：这道闸只属于 MCP 权益通道；模型 API 通道花 Credits，见下一个测试。
@@ -369,7 +390,8 @@ test('image tool gates n against remaining entitlement on the MCP channel',async
   } finally { rmSync(dir,{recursive:true,force:true}); }
 });
 
-test('model API channel neither gates on nor debits the image entitlement',async()=>{
+test('model API channel neither gates on nor debits the image entitlement',async(t)=>{
+  pinPublicDns(t);
   // 2026-11-23 根因修正：sk-sp- Key 只抵扣 Credits、不参与 Harness 计量。
   // 拿官方那 20 张去拦模型 API 是错位护栏（权益满着却拦掉能用的通道），
   // 记 image_generation 更会把「没花掉的权益」显示成已用。两件事都不许做。
@@ -391,7 +413,8 @@ test('model API channel neither gates on nor debits the image entitlement',async
   } finally { rmSync(dir,{recursive:true,force:true}); }
 });
 
-test('MCP channel counts each saved image even when a later download fails', async () => {
+test('MCP channel counts each saved image even when a later download fails', async(t)=>{
+  pinPublicDns(t);
   // 回归（2026-11-13）：旧实现全部下载成功才 record(paths.length)，中途失败/abort
   // → 已落盘的那几张全漏计 → 额度高估。每张成功即计 1，失败时已成功的仍计入。
   // 2026-11-23：权益记账搬到 MCP 通道（模型 API 不扣权益），回归口径不变。

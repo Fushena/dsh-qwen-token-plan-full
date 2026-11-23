@@ -6,7 +6,7 @@ import { QwenTokenPlanAdapter } from "./lib/adapter.js";
 import { registerMediaTools } from "./lib/media-tools.js";
 import { normalizeHarnessMode } from "./lib/harness.js";
 import { HarnessBudget } from "./lib/budget.js";
-import { fetchTierInfo, fetchEquityInfo, readConsoleCookie } from "./lib/gateway.js";
+import { fetchTierInfo, fetchEquityInfo, fetchServiceQuotas, readConsoleCookie } from "./lib/gateway.js";
 import { ReloginFlow } from "./lib/relogin.js";
 import { createProxyFetch, redactProxyUrl } from "./lib/proxy.js";
 import { trustedRouteRequest } from "./lib/route-guard.js";
@@ -41,7 +41,12 @@ export const Config = z.object({
   mcpEquity: z.any().default("auto")
     .description("权益 MCP 通道：auto（有 Key 就挂）/ off（不挂）/ 显式服务名列表，如 TextGenerateImage,EnhancedSearch。"),
   mcpHost: z.string().default(MCP_HOSTS.cn)
-    .description("MCP 服务基址。默认千问 AI 平台 One Key；百炼 DashScope 用 https://dashscope.aliyuncs.com。"),
+    .description("MCP 服务基址。默认百炼 DashScope；千问 AI 平台 One Key 用 https://maas.qianwenaiapi.com。"),
+  // 官方抵扣顺序是「服务自带免费额度 → Token Plan 附赠权益 → 88 折后付费」。
+  // 只读第二层会看到「20/20 满格」而误判调用没走通（2026-11-23 实测），故两层都拉。
+  // false 时只拉第二层（省两次控制台请求），面板退回单层显示。
+  serviceQuotas: z.boolean().default(true)
+    .description("是否同时拉取「服务自带免费额度」（第一层，官方先扣它）。关闭后面板只显示 Token Plan 附赠权益。"),
   models: z.array(z.any()).default([]),
   excludeModels: z.array(z.string()).default([]),
   imageModels: z.array(z.string()),
@@ -274,14 +279,25 @@ export function apply(ctx, config = {}) {
       try {
         const cookie = await resolveCookie();
         if (!cookie) return;
-        const list = await fetchEquityInfo({ cookie, fetchImpl: proxyFetch, signal: refreshSignal() });
-        // 成功但返回空列表（等级不含权益/接口结构变更）也要落盘：否则旧快照会一直
-        // 被当成新鲜数据，把已经变化的额度继续按旧值判定。
-        if (!stopped) {
-          budget.setEquities(list);
+        // 两层独立取数、独立落盘：任一层失败不该让另一层的快照作废
+        // （它们来自不同接口，第一层还多一跳 DescribeFqInstance，更容易失败）。
+        const [equityResult, serviceResult] = await Promise.allSettled([
+          fetchEquityInfo({ cookie, fetchImpl: proxyFetch, signal: refreshSignal() }),
+          config.serviceQuotas === false
+            ? Promise.resolve(null)
+            : fetchServiceQuotas({ cookie, fetchImpl: proxyFetch, signal: refreshSignal() }),
+        ]);
+        if (stopped) return;
+        if (equityResult.status === "fulfilled") {
+          // 成功但返回空列表（等级不含权益/接口结构变更）也要落盘：否则旧快照会一直
+          // 被当成新鲜数据，把已经变化的额度继续按旧值判定。
+          budget.setEquities(equityResult.value);
           // 官方余额是唯一的挂/摘依据：回源后立刻重算，耗尽的服务当场摘掉，
           // 让内置工具接回去（否则模型会继续调一个必然超额失败的 MCP 工具）。
           mcp.refresh();
+        }
+        if (serviceResult.status === "fulfilled" && serviceResult.value !== null) {
+          budget.setServiceQuotas(serviceResult.value);
         }
       } catch { /* 保留旧数据；下轮周期或面板刷新再试 */ }
       finally { equityRefreshing = null; }
@@ -340,14 +356,30 @@ export function apply(ctx, config = {}) {
   const statusPayload = () => {
     const snapshot = catalog.snapshot();
     const mcpStatus = mcp.status();
+    // 只取一次：status() 内部会 rollover + 逐项算余额，重复调用既浪费又可能拿到不同瞬时值。
+    const budgetStatus = budget.status();
     return {
-      ...budget.status(),
+      ...budgetStatus,
       // Harness 权益 MCP 通道状态：面板据此标注每项权益此刻花的是「权益额度」还是「Credits」。
       mcp: mcpStatus,
-      // 逐项来源：equity = 走 MCP 扣权益；credits = 走模型 API 扣 Credits。
-      // 面板不再只报余额，而是把「这笔钱从哪出」讲清楚（用户 2026-11-23 要求）。
+      // 逐项通道：equity = 走 MCP 扣免费额度；credits = 走模型 API 扣 Credits。
       equityChannels: Object.fromEntries(
         (budget.equitiesState() ?? []).map((state) => [state.key, equityChannel(state.key, mcpStatus)]),
+      ),
+      // 逐项扣减层（budget.status().chargeLayers）与通道正交，必须一起看：
+      //   通道 = 这笔调用走 MCP 还是模型 API；层 = 走 MCP 时先扣哪一层免费额度。
+      // 官方顺序是「服务自带免费额度 → Token Plan 权益 → 88 折后付费」，
+      // 所以「通道=equity 且 层=service」时第二层纹丝不动是正常的，不是没生效。
+      // 这里把两者合成一个面板直接可用的结论，避免前端自己拼逻辑拼错。
+      chargeSources: Object.fromEntries(
+        Object.entries(budgetStatus.chargeLayers ?? {}).map(([key, layer]) => {
+          // 第二层没有这一项的权益实例（视频）：它不存在「走模型 API 扣 Credits」这条路，
+          // 一律按免费额度层判定，否则会把「还有 10 秒免费试用」标成在花 Credits。
+          const hasPlanInstance = (budgetStatus.equityCounts ?? []).some((row) => row.key === key);
+          if (!hasPlanInstance) return [key, layer];
+          // 模型 API 通道不参与 Harness 计量：无论哪一层有余额，花的都是 Credits。
+          return [key, equityChannel(key, mcpStatus) === "credits" ? "credits" : layer];
+        }),
       ),
       // 登录会话状态：waiting = 已开登录页等待收割；failed = 上次会话失败（面板给指引）。
       relogin: relogin.state(),
@@ -611,7 +643,7 @@ export function apply(ctx, config = {}) {
     `（Responses=${route.endpoint}；Chat=${route.chatEndpoint}；` +
     `站点 ${autoEndpoint ? "自动判定中" : "手动指定"}；空闲超时 ${adapter.requestTimeoutMs}ms；` +
     `内置工具 ${harnessMode.mode}；权益预算 ${budget.enabled ? "开启（等级自动上限）" : "关闭"}；` +
-    `权益 MCP ${mcpBootText}；` +
+    `权益 MCP ${mcpBootText}；额度显示 ${config.serviceQuotas === false ? "仅 Token Plan 权益" : "服务自带额度 + Token Plan 权益（两层）"}；` +
     `媒体工具 ${config.mediaTools === false ? "关闭" : "开启"}；调用观察 ${[...watched].join("/")}；` +
     `目录补货 ${feed ? `开启 → ${String(config.feedProvider || "qwentokenplan")}${config.feedReasoning === false ? "（不含档位）" : ""}` : "关闭"}；目录每 ${refreshMinutes} 分钟刷新；` +
     `套餐每 ${tierRefreshHours} 小时刷新；Cookie 失效${config.autoRelogin === false ? "不会" : "将"}自动开登录页收割）`,
