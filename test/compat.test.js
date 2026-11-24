@@ -313,7 +313,7 @@ test('video tool forwards duration and clamps invalid values',async(t)=>{
     }
     return new Response('x',{headers:{'content-type':'video/mp4'}});
   }});
-  const videoTool=definitions[1];
+  const videoTool=definitions.find((def)=>def.name==='qwen_generate_video');
   // 合法 duration 透传
   await videoTool.execute({prompt:'p',duration:15},{agent:{},signal:new AbortController().signal});
   // 非法值（超范围 / 缺失）→ 不传 duration

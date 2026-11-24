@@ -419,6 +419,23 @@ test("C2 公网域名解析到内网一律拒绝（含混合答案与 IPv6 答�
   });
 });
 
+test("C2b 代理 fake-IP 段（198.18.0.0/15）域名解析放行 + warn（非真实内网，2026-11-24）", async (t) => {
+  await withTmpDir(async (dir) => {
+    // Clash/Surge fake-IP 把公网域名映射到 198.18.x.x；这是代理本地映射，真实路由由代理决定。
+    // 与 C3 解析失败放行同理：fail-closed 会打死合法下载。真内网段（C2）仍拒。
+    fakeDns(t, { "oss.fakeip.test": [{ address: "198.18.3.56", family: 4 }, { address: "198.19.0.1", family: 4 }] });
+    const warns = [];
+    const fetchImpl = capturingFetch(() => okPngResponse());
+    const logger = { warn: (m) => warns.push(m) };
+    const saved = await download(fetchImpl, "https://oss.fakeip.test/a.png", dir, "qwen-image", "png", undefined, undefined, logger);
+    assert.ok(saved.path.endsWith(".png"), "fake-IP 段域名应放行下载");
+    assert.equal(fetchImpl.calls.length, 1);
+    assert.ok(warns.some((w) => w.includes("fake-IP")), "应 warn 说明是代理 fake-IP");
+    // 但 IP 字面量 198.18.x.x 仍按私网拦（C1 已覆盖）：解析放行只针对域名。
+    await assert.rejects(download(fetchImpl, "https://198.18.3.56/a.png", dir, "qwen-image", "png"), /本机\/内网/);
+  });
+});
+
 test("C3 DNS 解析失败放行 + warn（lead 定稿：非 fail-closed，保代理可用性）", async (t) => {
   await withTmpDir(async (dir) => {
     fakeDns(t, {}); // 任何 host 都 ENOTFOUND
@@ -493,7 +510,8 @@ test("E1 轮询 HTTP 失败时保留已解析的上游 message", async (t) => {
     });
     const ctx = makeCtx(dir);
     registerMediaTools(ctx, makeOpts(fetchImpl));
-    const p = ctx.defs[1].execute({ prompt: "p" }, exec());
+    const videoTool = ctx.defs.find((def) => def.name === "qwen_generate_video");
+    const p = videoTool.execute({ prompt: "p" }, exec());
     p.catch(() => {}); // 先挂拒绝处理，避免 tick/flush 期间 unhandledRejection
     await flush(); // 让提交请求跑完、进入 sleep(POLL_INTERVAL_MS)
     t.mock.timers.tick(10_000); // 同步触发轮询定时器
@@ -512,7 +530,8 @@ test("E2 轮询 HTTP 失败且 body 不可解析时仍报 HTTP 状态（保留�
     });
     const ctx = makeCtx(dir);
     registerMediaTools(ctx, makeOpts(fetchImpl));
-    const p = ctx.defs[1].execute({ prompt: "p" }, exec());
+    const videoTool = ctx.defs.find((def) => def.name === "qwen_generate_video");
+    const p = videoTool.execute({ prompt: "p" }, exec());
     p.catch(() => {});
     await flush();
     t.mock.timers.tick(10_000);

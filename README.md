@@ -399,7 +399,7 @@ v0.5.1 起七项权益一一对应七个真实服务，实测全部 `connected`�
 
 ### 本地验证
 
-在插件目录执行 `npm test`（186 项：compat + relogin + stream + tier-retry + route-guard + model-display + catalog-feed + observer + capability-probe + config-knobs + stream-resilience + probe-integrity + media-safety + budget-merge + mcp-equity + quota-layers，含媒体下载 SSRF/重定向、流内错误分类、探测完整性、跨实例预算合并、纯文本生图端点回归、MCP 权益通道挂/摘与双通道计费口径、两层额度与扣减层判定）。runner 逐文件串行执行（Windows 上唯一全绿的组合，见 `test/run.mjs` 注释）。另有 `test/client-smoke.mjs` 单独跑（面板渲染桩，不在 runner 内；含来源标签与权益通道断言：缺 Key 时全标 Credits 且给出凭据名、连通项按扣减层标注、无 mcpManager 时说明原因；以及 v0.6.0 的两层断言：两小节并列且顺序与抵扣顺序一致、两层各自的真实数字、第一层耗尽转标套餐权益、第一层缺数据时不谎报、视频 10 秒试用按秒显示；v0.6.2 追加：第一层用尽行整行隐去、全部用尽时整节隐去、用尽与取数失败严格区分）。
+在插件目录执行 `npm test`（200 项：compat + relogin + stream + tier-retry + route-guard + model-display + catalog-feed + observer + capability-probe + config-knobs + stream-resilience + probe-integrity + media-safety + budget-merge + mcp-equity + quota-layers + tts，含媒体下载 SSRF/重定向、流内错误分类、探测完整性、跨实例预算合并、纯文本生图端点回归、MCP 权益通道挂/摘与双通道计费口径、两层额度与扣减层判定、语音合成落盘与按字符记账）。runner 逐文件串行执行（Windows 上唯一全绿的组合，见 `test/run.mjs` 注释）。另有 `test/client-smoke.mjs` 单独跑（面板渲染桩，不在 runner 内；含来源标签与权益通道断言：缺 Key 时全标 Credits 且给出凭据名、连通项按扣减层标注、无 mcpManager 时说明原因；以及 v0.6.0 的两层断言：两小节并列且顺序与抵扣顺序一致、两层各自的真实数字、第一层耗尽转标套餐权益、第一层缺数据时不谎报、视频 10 秒试用按秒显示；v0.6.2 追加：第一层用尽行整行隐去、全部用尽时整节隐去、用尽与取数失败严格区分）。
 
 下载类用例把 DNS 钉在 mock 上（`pinPublicDns`）：本机 DNS 会把 `*.invalid` 泛解析到
 `198.18.x.x`（RFC 2544 基准段，属 SSRF 闸的内网地址），不钉死就会随网络环境随机失败。
@@ -414,6 +414,29 @@ v0.5.1 起七项权益一一对应七个真实服务，实测全部 `connected`�
 测试使用本机已安装的 DeepSeek Harness 内置运行时与真实 `dsh-llm` 类，不访问网络、不读取个人凭据。其他安装路径可通过 `DSH_TEST_NODE` 和 `DSH_TEST_RUNTIME` 指定。
 
 真实联网验证需单独进行；正常测试不会运行图片或视频生成。
+
+## v0.7.0（2026-11-24，语音合成工具：自动落盘 + 给文件）
+
+**背景**：DSH 暂不支持音频附件——`dsh-mcp-client` 把 MCP 的 `audio` 块替换成占位文字、
+`dsh-attachment` 只有 `saveImages` 没有 `saveAudio`、客户端没有任何 `<audio>` 播放器。
+所以语音合成（TTS）的产物**无法在对话里内嵌播放**，百炼 TTS MCP 返回的本就是一个约 24h
+过期的 wav URL。语音识别（ASR）产物是文本，走标准 text 通道直接进对话，不受此限。
+
+**新增工具 `qwen_generate_speech`**（照 `qwen_generate_image` 的权益通道模式）：
+调百炼 `TextGenerateSpeech` MCP（`bailian_tts`）→ 提取音频 URL → **自动下载到会话工作目录**
+→ 返回本地文件路径（可点开收听、长期保存）与原始 URL。参数 `text`（≤2 万字符）、`voice`
+（电商直播男/女、温柔女声、沉稳男声、英文男/女生、老年男/女声、童声男/女，留空用默认）。
+走 MCP 权益通道：扣第一层语音合成额度（**按字符计**，`mcp_input_chars_mode`），不花 Credits；
+权益未就绪/耗尽时报错说明（语音**没有模型 API 回落通道**，不像生图可回落扣 Credits）。
+
+**实测踩到并修掉的三个真实形状坑**（离线测试先前都测不出，真实调用才暴露）：
+1. **URL 藏在 JSON 字符串里**：宿主把 TTS 结果放在 `content[].text`（一段 `{"result":"http://…wav?…","request_id":…}` JSON 字符串），没有 `structuredContent`。`extractMcpAudio` 原先只扫对象字段，提不出 URL。改为：字符串若以 `{`/`[` 开头先 `JSON.parse` 再走对象分支；正则排除反斜杠（避免把 JSON 转义的尾部 `\` 带进 URL）。
+2. **结果 URL 是 `http://`**：百炼 OSS 签名地址用 http，而下载安全闸只收 https。OSS 同域名支持 https 且签名与协议无关，故对 `*.aliyuncs.com` 升级 https 后再过闸；其它域名的 http 仍拒（fail-closed 不放宽）。
+3. **代理 fake-IP 被误判内网**：Clash Verge（TUN 模式，`utun7` 198.18.0.1）把公网 OSS 域名解析到 `198.18.3.56`（RFC 2544 基准保留段）。SSRF 闸原把该段一律当内网拒。改为：**IP 字面量** `198.18.x.x` 仍拒（C1 钉死）；**域名经 DNS 解析**落到该段时放行 + warn（与 C3 解析失败放行同理——本地 DNS 已被代理接管，真实路由由代理侧决定，fail-closed 会打死合法下载）。真内网段（127/10/172.16/192.168/CGNAT/::1/ULA…）仍一律拒。
+
+**记账口径修正**：上游在**合成成功那一刻**即扣字符，与下载成败无关。故 `budget.record("tts", text.length)` 放在下载**之前**——下载失败也要记，否则本地账本少计（与生图「每张落盘成功即计」不同：生图按张、下载失败那张确实没产出；语音按字符、合成已发生）。`callTool` 直调 `definition.execute` 不经 `tools.guard`，须手动记一次，不会重复计数。
+
+**验证**：`npm test` 200 项全绿（新增 `tts.test.js` S1–S13：落盘+RIFF/WAVE 头校验、按字符记账、额度预检、未就绪/耗尽报错、空/超长文本、上游字段名匹配、音频 URL 优先、落盘失败仍记账不留半截、不传 voice 不塞字段、JSON 字符串提 URL、OSS http→https、非 OSS http 仍拒、fake-IP 放行；`media-safety` 新增 C2b fake-IP 域名放行+字面量仍拒）；`client-smoke` 通过。真实调用 `qwen_generate_speech`（温柔女声 16 字符）→ 落盘 `qwen-speech-…wav`（RIFF/WAVE PCM 16bit mono 24kHz，184KB），第一层 tts 扣 16 字符、`chargeSources.tts=service`。
 
 ## v0.6.2（2026-11-24，第一层用尽即隐去：它不会刷新）
 
