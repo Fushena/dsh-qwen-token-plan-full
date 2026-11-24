@@ -394,7 +394,7 @@ v0.5.1 起七项权益一一对应七个真实服务，实测全部 `connected`�
 
 ### 本地验证
 
-在插件目录执行 `npm test`（185 项：compat + relogin + stream + tier-retry + route-guard + model-display + catalog-feed + observer + capability-probe + config-knobs + stream-resilience + probe-integrity + media-safety + budget-merge + mcp-equity + quota-layers，含媒体下载 SSRF/重定向、流内错误分类、探测完整性、跨实例预算合并、纯文本生图端点回归、MCP 权益通道挂/摘与双通道计费口径、两层额度与扣减层判定）。runner 逐文件串行执行（Windows 上唯一全绿的组合，见 `test/run.mjs` 注释）。另有 `test/client-smoke.mjs` 单独跑（面板渲染桩，不在 runner 内；含来源标签与权益通道断言：缺 Key 时全标 Credits 且给出凭据名、连通项按扣减层标注、无 mcpManager 时说明原因；以及 v0.6.0 的两层断言：两小节并列且顺序与抵扣顺序一致、两层各自的真实数字、第一层耗尽转标套餐权益、第一层缺数据时不谎报、视频 10 秒试用按秒显示）。
+在插件目录执行 `npm test`（186 项：compat + relogin + stream + tier-retry + route-guard + model-display + catalog-feed + observer + capability-probe + config-knobs + stream-resilience + probe-integrity + media-safety + budget-merge + mcp-equity + quota-layers，含媒体下载 SSRF/重定向、流内错误分类、探测完整性、跨实例预算合并、纯文本生图端点回归、MCP 权益通道挂/摘与双通道计费口径、两层额度与扣减层判定）。runner 逐文件串行执行（Windows 上唯一全绿的组合，见 `test/run.mjs` 注释）。另有 `test/client-smoke.mjs` 单独跑（面板渲染桩，不在 runner 内；含来源标签与权益通道断言：缺 Key 时全标 Credits 且给出凭据名、连通项按扣减层标注、无 mcpManager 时说明原因；以及 v0.6.0 的两层断言：两小节并列且顺序与抵扣顺序一致、两层各自的真实数字、第一层耗尽转标套餐权益、第一层缺数据时不谎报、视频 10 秒试用按秒显示）。
 
 下载类用例把 DNS 钉在 mock 上（`pinPublicDns`）：本机 DNS 会把 `*.invalid` 泛解析到
 `198.18.x.x`（RFC 2544 基准段，属 SSRF 闸的内网地址），不钉死就会随网络环境随机失败。
@@ -409,6 +409,31 @@ v0.5.1 起七项权益一一对应七个真实服务，实测全部 `connected`�
 测试使用本机已安装的 DeepSeek Harness 内置运行时与真实 `dsh-llm` 类，不访问网络、不读取个人凭据。其他安装路径可通过 `DSH_TEST_NODE` 和 `DSH_TEST_RUNTIME` 指定。
 
 真实联网验证需单独进行；正常测试不会运行图片或视频生成。
+
+## v0.6.1（2026-11-24，冷启动竞态：权益通道不再永久降级）
+
+**症状**：重启 App 后 `status.mcp` 报 `{enabled:false, reason:"no-manager"}`、
+`chargeSources` 七项全 `credits`、第一层额度一行都没有——整条权益通道失效，
+但热重载（`set_plugin enabled=true`）后一切正常。
+
+**根因**：宿主的 `mcp-manager` 是**独立插件**，冷启动时可能比本插件晚就绪。
+旧实现在 `registerEquityMcp` 里 `ctx.get("mcpManager")` **抓一次就定死**，
+拿不到就直接返回 noop 降级对象，此后没有任何机会再试。热重载时 manager 早已 active，
+所以这个 bug 在开发期完全看不见——只有真正重启 App 才暴露。
+
+**修法**：manager 改为**动态解析**（`resolveManager()`），每次 `rearm()` 重解析一次；
+拿不到时不再提前返回，而是照常建立状态并用宿主 `timer` 每 2 秒轮询，
+**出现即挂载并停止轮询**（不长期占用）。`mount()` 在无 manager 时静默跳过而非记成失败；
+`status().reason` 如实报 `no-manager`，`usesEquity`/`equityChannel` 一律返 false/credits，
+不谎报省钱。`dispose()` 一并撤掉轮询。
+
+新增回归 `a manager that appears later is picked up instead of degrading forever`：
+假宿主支持 `managerLate`，先断言未就绪时不挂且不声称权益，再 `bringManagerUp()` +
+`rearm()` 断言七项全挂。**这类「只在冷启动出现」的竞态，必须有意识地构造晚就绪夹具才测得到。**
+
+实测：修复后热重载，`mcp.reason=mounted`、7/7 connected、第一层八行回来
+（`search_pro=1`、`image_generation=1`、`tts=33`）、`chargeSources` 八项全 `service`、
+`tier.source` 从 `builtin` 恢复为 `gateway`。
 
 ## v0.6.0（2026-11-23，两层免费额度与「当前扣减」）
 
@@ -439,7 +464,7 @@ v0.5.1 起七项权益一一对应七个真实服务，实测全部 `connected`�
 - **第一层耗尽不停用工具**：它只意味着开始扣第二层，能力没断。
 - 视频只在第一层有额度，`chargeSources` 对它按层判定而非一律标 Credits。
 
-**验证**：`npm test` 185 项全绿（新增 `quota-layers` 9）；`client-smoke` 覆盖两层并列、
+**验证**：`npm test` 186 项全绿（新增 `quota-layers` 9 与冷启动竞态回归 1）；`client-smoke` 覆盖两层并列、
 第一层耗尽转标套餐权益、第一层缺数据不谎报、视频按秒显示；热重载后实测 status 出两层
 真实数字（第一层三项已扣、第二层七项满格）、八项 `chargeSources` 全 `service`；
 面板 bundle 经 combo 地址取回 200，含两小节标题与「当前扣减」。

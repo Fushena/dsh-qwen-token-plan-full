@@ -12,21 +12,25 @@ import {
  * states 控制 manager.list() 报的连接状态——「注册了」与「连通了」必须分开测，
  * 因为抑制内置工具只认连通（连不上却摘内置工具等于把搜索能力整个弄丢）。
  */
-function makeHost({ key = null, states = {}, defs = [] } = {}) {
+function makeHost({ key = null, states = {}, defs = [], managerLate = false } = {}) {
   const registered = new Map();
   const guards = [];
   const listeners = new Map();
   const calls = [];
   let credentialValue = key;
+  // managerLate：模拟冷启动竞态——宿主 mcp-manager 比本插件晚就绪。
+  let managerPresent = !managerLate;
   const host = {
     registered, guards, calls,
     setKey(value) { credentialValue = value; },
+    bringManagerUp() { managerPresent = true; },
     states,
     defs,
     emit(ref) { for (const fn of listeners.get('credentials/reference-updated') ?? []) fn(ref); },
     ctx: {
       get(name) {
         if (name === 'mcpManager') {
+          if (!managerPresent) return undefined;
           return {
             register(service, entry) {
               if (registered.has(service)) throw new Error(`mcp-manager: server "${service}" is already configured or registered`);
@@ -268,6 +272,25 @@ test('off mode and a host without mcpManager degrade to credits without throwing
   assert.equal(noManager.status().reason, 'no-manager');
   assert.deepEqual(noManager.mountedServices(), []);
   noManager.dispose();
+});
+
+// 冷启动竞态回归：宿主 mcp-manager 是独立插件，重启 App 时可能比本插件晚就绪。
+// 旧实现在 apply 时抓一次 manager 就定死，导致整条权益通道永久降级（热重载时看不出来）。
+test('a manager that appears later is picked up instead of degrading forever', async () => {
+  const host = makeHost({ key: 'sk-fixture', managerLate: true });
+  const mcp = registerEquityMcp(host.ctx, { budget: budgetOf({ image_generation: 20 }) });
+  await mcp.rearm();
+  assert.equal(host.registered.size, 0, 'manager 未就绪时不挂');
+  assert.equal(mcp.status().reason, 'no-manager');
+  assert.equal(mcp.usesEquity('image_generation'), false, '未就绪不得声称走权益');
+  assert.equal(equityChannel('image_generation', mcp.status()), 'credits');
+  // 宿主就绪后，下一次重算必须接上（权益回源/凭据更新/轮询都会触发 rearm）。
+  host.bringManagerUp();
+  await mcp.rearm();
+  assert.equal(host.registered.size, 7, 'manager 就绪后七项全挂');
+  assert.equal(mcp.status().reason, 'mounted');
+  assert.equal(mcp.usesEquity('image_generation'), true);
+  mcp.dispose();
 });
 
 test('dispose unmounts every service and stays idempotent', async () => {
