@@ -360,6 +360,11 @@ v0.5.1 起七项权益一一对应七个真实服务，实测全部 `connected`�
   必须替换成 `GMT+0800` 再解析，否则到期时间错开 14 小时。
 - 视频只在第①层有额度（10 秒试用），第②层没有独立实例：第①层显示真实余量，
   第②层仍显示「✓ 包含」。不足 1 分钟的秒级额度按秒显示，避免被四舍五入成「0h/0h」。
+- **第①层不刷新**（v0.6.2 起据此改显示）：`DescribeFqInstance` 的
+  `CurrentCycleStartTime`/`CurrentCycleEndTime` 与 `StartTime`/`EndTime` 完全相同
+  （实测八项皆然，9/2→12/2、9/4→12/4），即整个生命周期只有一个周期，**用尽或到期都不补发**。
+  所以面板把**用尽的行整行隐去**，不留「0/100」让人误以为还会回满；全部用尽时整个第一层小节隐去。
+  这与「取数失败」严格区分：后者才给可重试提示。第②层不受影响，它按订阅周期每月重发。
 - 第①层是账号级试用额度，**不随订阅周期清零**；跨实例合并时两层各自比新鲜度
   （来自不同接口，任一层失败不该让另一层的快照作废）。
 
@@ -394,7 +399,7 @@ v0.5.1 起七项权益一一对应七个真实服务，实测全部 `connected`�
 
 ### 本地验证
 
-在插件目录执行 `npm test`（186 项：compat + relogin + stream + tier-retry + route-guard + model-display + catalog-feed + observer + capability-probe + config-knobs + stream-resilience + probe-integrity + media-safety + budget-merge + mcp-equity + quota-layers，含媒体下载 SSRF/重定向、流内错误分类、探测完整性、跨实例预算合并、纯文本生图端点回归、MCP 权益通道挂/摘与双通道计费口径、两层额度与扣减层判定）。runner 逐文件串行执行（Windows 上唯一全绿的组合，见 `test/run.mjs` 注释）。另有 `test/client-smoke.mjs` 单独跑（面板渲染桩，不在 runner 内；含来源标签与权益通道断言：缺 Key 时全标 Credits 且给出凭据名、连通项按扣减层标注、无 mcpManager 时说明原因；以及 v0.6.0 的两层断言：两小节并列且顺序与抵扣顺序一致、两层各自的真实数字、第一层耗尽转标套餐权益、第一层缺数据时不谎报、视频 10 秒试用按秒显示）。
+在插件目录执行 `npm test`（186 项：compat + relogin + stream + tier-retry + route-guard + model-display + catalog-feed + observer + capability-probe + config-knobs + stream-resilience + probe-integrity + media-safety + budget-merge + mcp-equity + quota-layers，含媒体下载 SSRF/重定向、流内错误分类、探测完整性、跨实例预算合并、纯文本生图端点回归、MCP 权益通道挂/摘与双通道计费口径、两层额度与扣减层判定）。runner 逐文件串行执行（Windows 上唯一全绿的组合，见 `test/run.mjs` 注释）。另有 `test/client-smoke.mjs` 单独跑（面板渲染桩，不在 runner 内；含来源标签与权益通道断言：缺 Key 时全标 Credits 且给出凭据名、连通项按扣减层标注、无 mcpManager 时说明原因；以及 v0.6.0 的两层断言：两小节并列且顺序与抵扣顺序一致、两层各自的真实数字、第一层耗尽转标套餐权益、第一层缺数据时不谎报、视频 10 秒试用按秒显示；v0.6.2 追加：第一层用尽行整行隐去、全部用尽时整节隐去、用尽与取数失败严格区分）。
 
 下载类用例把 DNS 钉在 mock 上（`pinPublicDns`）：本机 DNS 会把 `*.invalid` 泛解析到
 `198.18.x.x`（RFC 2544 基准段，属 SSRF 闸的内网地址），不钉死就会随网络环境随机失败。
@@ -409,6 +414,27 @@ v0.5.1 起七项权益一一对应七个真实服务，实测全部 `connected`�
 测试使用本机已安装的 DeepSeek Harness 内置运行时与真实 `dsh-llm` 类，不访问网络、不读取个人凭据。其他安装路径可通过 `DSH_TEST_NODE` 和 `DSH_TEST_RUNTIME` 指定。
 
 真实联网验证需单独进行；正常测试不会运行图片或视频生成。
+
+## v0.6.2（2026-11-24，第一层用尽即隐去：它不会刷新）
+
+**问题**：第一层用尽后面板仍显示「0/100张」。但这层是**一次性试用额度**，不会回满——
+留着 0 会让人以为下个月还会补，从而误判可用量。
+
+**先证实「不刷新」再改显示**（不靠猜）：`DescribeFqInstance` 返回的
+`CurrentCycleStartTime`/`CurrentCycleEndTime` 与 `StartTime`/`EndTime` **完全相同**，
+八项皆然（9/2→12/2、9/4→12/4）。整个生命周期只有一个周期，没有月度重置。
+对照第②层：它按订阅周期每月重发，所以两层显示逻辑必须不同。
+
+**改法**（`lib/client.js` 的 `QuotaLayers`）：先按 `remaining > 0` 过滤出可见行，
+再决定是否画小节标题与到期提示——
+
+- 部分用尽：只隐去用尽的那几行，其余照常显示，到期日取**可见行**里最早的。
+- 全部用尽：整个第一层小节隐去（不留空标题）。
+- **取数失败**（`serviceQuotas` 为空数组）：仍给可重试提示。用尽 ≠ 失败，两者严格区分。
+- 第②层完全不受影响；用尽项的扣减层照常落到第②层并标「套餐权益」。
+
+新增冒烟断言：全部用尽时无「0/100张」、无第一层标题、无重试提示、第二层仍完整；
+部分用尽时只隐图像行、搜索行仍在、用尽项在第二层标「套餐权益」。
 
 ## v0.6.1（2026-11-24，冷启动竞态：权益通道不再永久降级）
 

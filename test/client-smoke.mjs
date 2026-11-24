@@ -252,6 +252,8 @@ assert.ok(!planSegment.includes('qtpf-src service'), '第一层在扣时第二�
 assert.ok(planSegment.includes('qtpf-src paid'), '两层都耗尽的项仍在第二层标「按量付费」');
 
 // 第一层耗尽 → 该行标「套餐权益」，顶部提示改为「现在扣套餐权益」。
+// 第一层**不刷新**（CurrentCycle 与整个生命周期同长），所以用尽的行整行隐去，
+// 不留「0/100」让人误以为还会回满。
 const serviceOut = structuredClone(STATUS);
 serviceOut.serviceQuotas = SERVICE.map((row) => ({ ...row, used: row.quota, remaining: 0 }));
 serviceOut.chargeSources = Object.fromEntries(Object.keys(serviceOut.chargeSources).map((k) => [k, 'equity']));
@@ -260,7 +262,24 @@ const serviceOutPanel = serviceOutJson.slice(serviceOutJson.indexOf('qtpf-panel'
 assert.ok(serviceOutPanel.includes('qtpf-src equity'), '第一层耗尽后标「套餐权益」');
 assert.ok(serviceOutPanel.includes('现在扣的是套餐附赠权益'), '提示改为正在扣第二层');
 assert.ok(!serviceOutPanel.includes('官方先扣服务自带免费额度'), '第一层耗尽后不再说「先扣服务额度」');
-assert.ok(serviceOutPanel.includes('0/100张'), '第一层耗尽行显示 0');
+assert.ok(!serviceOutPanel.includes('0/100张'), '第一层用尽的行不再显示（这一层不刷新）');
+assert.ok(!serviceOutPanel.includes('服务自带免费额度'), '全部用尽时整个第一层小节隐去');
+assert.ok(!serviceOutPanel.includes('服务自带额度暂不可用'), '用尽 ≠ 取数失败，不给重试提示');
+assert.ok(serviceOutPanel.includes('14/20张'), '第一层隐去后第二层照常完整显示');
+
+// 部分用尽：只隐去用尽的那几行，其余仍在第一层显示。
+const servicePartial = structuredClone(STATUS);
+servicePartial.serviceQuotas = SERVICE.map((row) => (
+  row.key === 'image_generation' ? { ...row, used: row.quota, remaining: 0 } : row
+));
+servicePartial.chargeSources = { ...servicePartial.chargeSources, image_generation: 'equity' };
+const partialJson = renderWith('budget', servicePartial);
+const partialPanel = partialJson.slice(partialJson.indexOf('qtpf-panel'));
+assert.ok(partialPanel.includes('服务自带免费额度'), '仍有余量时第一层小节保留');
+assert.ok(!partialPanel.includes('0/100张'), '用尽的图像行隐去');
+assert.ok(partialPanel.includes('199/200次'), '未用尽的搜索行仍在第一层');
+const partialPlan = partialPanel.slice(partialPanel.indexOf('Token Plan 附赠权益'));
+assert.ok(partialPlan.includes('qtpf-src equity'), '用尽项的扣减层落到第二层并标注');
 
 // 第一层取数失败：不画空表，给可操作提示，第二层照常显示（能力没断）。
 const noService = structuredClone(STATUS);
