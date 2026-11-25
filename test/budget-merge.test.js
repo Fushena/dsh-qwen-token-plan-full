@@ -331,3 +331,108 @@ test("B2-guard 正常时钟：1 小时内不重复提示（护栏）", (t) => {
   a.noteSuppression({ dropped: [], until: now + 20 * DAY_MS });
   assert.equal(infos.length, 0);
 });
+
+// ---------------------------------------------------------------------------
+// 2026-11-25 高危回归：估算 +30d 锚点不得拒绝真实网关 setTier()；第一层三元组原子合并
+// ---------------------------------------------------------------------------
+
+test("A7 估算 +30d 锚点不得拒绝更近的真实网关 setTier()（校准锚点并保留档位与历史计数）", (t) => {
+  const { filePath, logger, readState } = setup(t);
+  const now = Date.now();
+  const a = new HarnessBudget({ filePath, logger });
+  // 首次无 Cookie 兜底写入估算锚点（now + 30d）与 standard 兜底档位，并记录 2 次调用。
+  a.setTierFallback("missing cookie");
+  a.record("web_search", 2);
+  const before = readState();
+  assert.equal(before.tier.source, "builtin");
+  assert.equal(before.tier.specCode, "standard");
+  assert.ok(before.periodAnchor > now + 25 * DAY_MS, "兜底应写入估算 +30d 锚点");
+
+  // 用户随后登录，网关返回真实 Pro 档位与更近的重置日（now + 10d）。
+  const realReset = now + 10 * DAY_MS;
+  a.setTier({
+    specCode: "pro",
+    usage: { per1MonthPercentage: 0.125, per1MonthResetTime: realReset },
+    subscription: { remainingDays: 10 },
+    fetchedAt: now,
+  });
+  const after = readState();
+  assert.equal(after.periodAnchor, realReset, "真实网关 resetTime 不得被更大的估算 +30d 锚点覆盖回退");
+  assert.equal(after.periodAnchorSource, "gateway");
+  assert.equal(after.tier.source, "gateway", "真实网关 tier 不得被回滚成 builtin 兜底");
+  assert.equal(after.tier.specCode, "pro", "Pro 档位必须落盘生效");
+  assert.equal(after.byEquity.search_pro, 2, "校准同周期锚点时须保留先前已记用量");
+  assert.equal(a.status().tier.specCode, "pro");
+});
+
+test("A8 第一层 serviceQuotas 三元组在跨周期合并时必须原子一致（不拆散、不回滚）", (t) => {
+  const { filePath, logger, writeState, readState } = setup(t);
+  const now = Date.now();
+  const oldAnchor = now - 1000;
+  const newAnchor = now + 20 * DAY_MS;
+  const expiresAt = now + 30 * DAY_MS;
+
+  // 场景 1（diskNewer）：本实例在旧周期，但持有更新的第一层快照（available=10, fetchedAt=now+5000, used=90）；
+  // 磁盘已滚入新周期，但第一层快照更旧（available=80, fetchedAt=now-5000, used=20）。
+  writeState({
+    periodAnchor: oldAnchor,
+    periodAnchorSource: "gateway",
+    totalCalls: 5,
+    byEquity: { search_pro: 5 },
+    byService: { image_generation: 90 },
+    tier: tier(now - 5000, oldAnchor),
+    serviceQuotas: [{ key: "image_generation", unit: "张", available: 10, total: 100, expiresAt }],
+    serviceQuotasFetchedAt: now + 5000,
+    serviceQuotaUsedAtFetch: { image_generation: 90 },
+  });
+  const a = new HarnessBudget({ filePath, logger });
+  writeState({
+    periodAnchor: newAnchor,
+    periodAnchorSource: "gateway",
+    totalCalls: 6,
+    byEquity: { search_pro: 1 },
+    byService: { image_generation: 20 },
+    tier: tier(now, newAnchor),
+    serviceQuotas: [{ key: "image_generation", unit: "张", available: 80, total: 100, expiresAt }],
+    serviceQuotasFetchedAt: now - 5000,
+    serviceQuotaUsedAtFetch: { image_generation: 20 },
+  });
+  a.setEquities(null); // 走 diskNewer 合并分支
+  const d1 = readState();
+  assert.equal(d1.serviceQuotas[0].available, 10, "diskNewer 不得把旧 available(80) 与新 usedAtFetch(90) 拆散混配");
+  assert.equal(d1.serviceQuotasFetchedAt, now + 5000);
+  assert.equal(d1.serviceQuotaUsedAtFetch.image_generation, 90);
+
+  // 场景 2（mine rolled over）：本实例滚入新周期，磁盘还停在旧周期但第一层快照更新 → 不得把磁盘较新第一层覆盖回旧值。
+  const filePath2 = `${filePath}.r2`;
+  fs.writeFileSync(filePath2, JSON.stringify({
+    periodAnchor: oldAnchor,
+    periodAnchorSource: "gateway",
+    totalCalls: 10,
+    byEquity: { search_pro: 10 },
+    byService: { image_generation: 5 },
+    tier: tier(now, newAnchor),
+    serviceQuotas: [{ key: "image_generation", unit: "张", available: 95, total: 100, expiresAt }],
+    serviceQuotasFetchedAt: now - 10_000,
+    serviceQuotaUsedAtFetch: { image_generation: 5 },
+  }));
+  const b = new HarnessBudget({ filePath: filePath2, logger });
+  // 另一实例在旧周期写入了更新的第一层快照（available=70, fetchedAt=now-1000, used=30）。
+  fs.writeFileSync(filePath2, JSON.stringify({
+    periodAnchor: oldAnchor,
+    periodAnchorSource: "gateway",
+    totalCalls: 10,
+    byEquity: { search_pro: 10 },
+    byService: { image_generation: 30 },
+    tier: tier(now, newAnchor),
+    serviceQuotas: [{ key: "image_generation", unit: "张", available: 70, total: 100, expiresAt }],
+    serviceQuotasFetchedAt: now - 1000,
+    serviceQuotaUsedAtFetch: { image_generation: 30 },
+  }));
+  b.record("web_search"); // b 滚入 newAnchor，走 else 分支
+  const d2 = JSON.parse(fs.readFileSync(filePath2, "utf8"));
+  assert.equal(d2.periodAnchor, newAnchor);
+  assert.equal(d2.serviceQuotas[0].available, 70, "本实例滚周期时不得把磁盘上更新的第一层快照覆盖回旧值");
+  assert.equal(d2.serviceQuotasFetchedAt, now - 1000);
+  assert.equal(d2.serviceQuotaUsedAtFetch.image_generation, 30);
+});

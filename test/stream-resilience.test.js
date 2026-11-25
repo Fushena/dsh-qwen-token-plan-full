@@ -438,3 +438,19 @@ test('新增的每个配置字段都带 description，且默认值不变', () =>
   assert.equal(resolved.registerProvider, true);
   assert.equal(resolved.retryPolicy.maxRetries, 2);
 });
+
+test('Chat 流式 tool_calls 续传分片含空串或 null 工具名时不得覆盖原工具名', async () => {
+  const body = sseBody(
+    'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"read_file","arguments":"{\\"p\\":"}}]}}]}\n\n' +
+    'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"","function":{"name":"","arguments":"\\"a\\""}}]}}]}\n\n' +
+    'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":null,"arguments":"}"}}]}}]}\n\n' +
+    'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n\n',
+  );
+  const chunks = [];
+  for await (const chunk of chatToDshChunks(body, undefined)) chunks.push(chunk);
+  const end = chunks.find((c) => c.type === 'block-end' && c.block.type === 'tool-call');
+  assert.ok(end, '应产出 tool-call block-end');
+  assert.equal(end.block.id, 'call_1');
+  assert.equal(end.block.name, 'read_file', '空串或 null 的 function.name 不得覆盖原工具名');
+  assert.equal(end.block.arguments, '{"p":"a"}');
+});

@@ -362,3 +362,39 @@ test("I1: 探测用图必须满足上游最小边长（>10px），否则每个�
   assert.ok(width > 10 && height > 10,
     `探测图 ${width}×${height} 太小：上游要求边长 >10，会把「不支持图片」误判成能力事实`);
 });
+
+
+// —— 2026-11-25 高危回归：新 GLM 不走 /responses 探测；非 Qwen 探测结果保留各自家族规格 ——
+
+test("J1: 新发现的 GLM 模型跳过 /responses 探测，保留 transport=chat、思考能力与空 harnessTools", async () => {
+  clearProbeCache();
+  const ids = ["glm-5.4-preview"];
+  const fetchImpl = routingFetch({
+    ids,
+    probe: async () => ({ ok: false, status: 400, text: async () => "unsupported protocol" }),
+  });
+  const catalog = makeCatalog({ ids, fetchImpl });
+  const updated = await catalog.refresh();
+  assert.equal(updated, true);
+  assert.equal(fetchImpl.calls.probe, 0, "GLM 走 Chat Completions，不得向 /responses 发探测请求");
+  const glm = catalog.find("glm-5.4-preview");
+  assert.ok(glm, "新 GLM 模型应进入目录");
+  assert.equal(glm.transport, "chat", "GLM 必须保留 transport: chat");
+  assert.equal(glm.reasoning, true, "GLM 不得因 /responses 400 被误标为不支持思考");
+  assert.deepEqual(glm.harnessTools, [], "GLM 不得被注入 Qwen 专属内置工具");
+});
+
+test("J2: 新发现的非 Qwen 模型（如 DeepSeek）能力探测后保留自身家族的 contextWindow 与空 harnessTools", async () => {
+  clearProbeCache();
+  const ids = ["deepseek-v4-preview"];
+  const fetchImpl = routingFetch({ ids });
+  const catalog = makeCatalog({ ids, fetchImpl });
+  const updated = await catalog.refresh();
+  assert.equal(updated, true);
+  assert.ok(fetchImpl.calls.probe > 0, "非 GLM 的新 Responses 模型照常探测");
+  const ds = catalog.find("deepseek-v4-preview");
+  assert.ok(ds);
+  assert.match(ds.capabilities, /能力已探测/);
+  assert.equal(ds.contextWindow, 163840, "DeepSeek 应保留家族 contextWindow，不得硬编码成 1000000");
+  assert.deepEqual(ds.harnessTools, [], "DeepSeek 不得被硬塞 Qwen 专属内置工具");
+});

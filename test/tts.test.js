@@ -296,3 +296,30 @@ test("S10 宿主真实形状：content[].text 是 JSON 字符串也能提出 URL
     assert.equal(fetchImpl.calls[0].url, realUrl);
   });
 });
+
+
+test("S14 语音合成耗尽本地 tts 权益后立即触发 mcp.refresh() 摘除服务", async (t) => {
+  await withTmpDir(async (dir) => {
+    fakeDns(t);
+    const fetchImpl = capturingFetch(() => okWavResponse());
+    const ctx = makeCtx(dir);
+    let remaining = 2;
+    let refreshed = 0;
+    const budget = {
+      equityState: (key) => (key === "tts" ? { key: "tts", quota: 100, used: 100 - remaining, remaining, unit: "字符" } : undefined),
+      record: (key, count = 1) => { if (key === "tts") remaining = Math.max(0, remaining - count); },
+    };
+    const mcp = {
+      usesEquity: () => true,
+      refresh: () => { refreshed += 1; },
+      callTool: async () => ({
+        tool: "bailian_tts",
+        value: { content: [{ type: "text", text: JSON.stringify({ result: "https://cdn.test/a.wav" }) }] },
+      }),
+    };
+    registerMediaTools(ctx, makeOpts(fetchImpl, { mcp, budget }));
+    await speechOf(ctx).execute({ text: "你好" }, exec());
+    assert.equal(remaining, 0);
+    assert.equal(refreshed, 1, "本地记账把 tts 扣到 0 后必须立即调用 mcp.refresh()");
+  });
+});

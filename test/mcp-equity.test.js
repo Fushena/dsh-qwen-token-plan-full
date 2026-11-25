@@ -439,3 +439,41 @@ test('Q5 equityUnitsForDispatch 的单位口径与脏值收敛', () => {
   assert.equal(equityUnitsForDispatch('asr', { file_urls: ['https://x/a.wav'] }), 1, 'asr 派发时只有占位');
   assert.equal(equityUnitsForDispatch('tts', undefined), 1);
 });
+
+
+test('本地记账耗尽权益后，tools/result 立即刷新并摘除对应 MCP 服务（防 10 分钟空窗按量付费）', async () => {
+  const remaining = { search_pro: 1, asr: 100, image_generation: 5 };
+  const budget = {
+    equityState(key) {
+      if (remaining[key] == null) return undefined;
+      return { key, quota: 100, used: 100 - remaining[key], remaining: remaining[key], unit: '次', source: 'official' };
+    },
+    record(key, count = 1) {
+      if (remaining[key] != null) remaining[key] = Math.max(0, remaining[key] - count);
+    },
+  };
+  const host = makeHost({ key: 'sk-fixture' });
+  const mcp = registerEquityMcp(host.ctx, { budget });
+  await mcp.rearm();
+  assert.ok(mcp.mountedServices().includes('EnhancedSearch'));
+  assert.ok(mcp.mountedServices().includes('SpeechGenerateText'));
+
+  const guard = host.guards[0];
+  // 1) 普通服务（search_pro 剩 1）：guard 派发记账后在途期不拆服务，tools/result 完成后立刻摘除。
+  const searchExec = { name: 'mcp__EnhancedSearch__search_pro', callId: 's-last', arguments: { query: 'q' } };
+  guard(searchExec);
+  assert.equal(remaining.search_pro, 0);
+  assert.ok(mcp.mountedServices().includes('EnhancedSearch'), '在途调用执行前不得拆掉当前服务');
+  host.emitResult(searchExec, { isError: false, value: { content: [{ type: 'text', text: 'ok' }] } });
+  assert.ok(!mcp.mountedServices().includes('EnhancedSearch'), 'tools/result 完成后耗尽服务必须立即摘除');
+  assert.ok(mcp.mountedServices().includes('TextGenerateImage'), '其他仍有余额的服务不受影响');
+
+  // 2) ASR（剩 100 秒）：guard 先记 1 秒，tools/result 按 duration=120 补记 119 秒耗尽 → 当场摘除。
+  const asrExec = { name: 'mcp__SpeechGenerateText__bailian_asr', callId: 'a-last', arguments: {} };
+  guard(asrExec);
+  assert.ok(mcp.mountedServices().includes('SpeechGenerateText'));
+  host.emitResult(asrExec, { isError: false, value: { structuredContent: { duration: 120 } } });
+  assert.equal(remaining.asr, 0);
+  assert.ok(!mcp.mountedServices().includes('SpeechGenerateText'), 'ASR 补记耗尽后必须立即摘除');
+  mcp.dispose();
+});
