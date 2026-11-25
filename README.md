@@ -399,7 +399,7 @@ v0.5.1 起七项权益一一对应七个真实服务，实测全部 `connected`�
 
 ### 本地验证
 
-在插件目录执行 `npm test`（204 项：compat + relogin + stream + tier-retry + route-guard + model-display + catalog-feed + observer + capability-probe + config-knobs + stream-resilience + probe-integrity + media-safety + budget-merge + mcp-equity + quota-layers + tts，含媒体下载 SSRF/重定向、流内错误分类（Chat 与 Responses 两条路线）、HTTP 429 与额度措辞的优先级、探测完整性、跨实例预算合并、纯文本生图端点回归、MCP 权益通道挂/摘与双通道计费口径、两层额度与扣减层判定、语音合成落盘与按字符记账）。runner 逐文件串行执行（Windows 上唯一全绿的组合，见 `test/run.mjs` 注释）。另有 `test/client-smoke.mjs` 单独跑（面板渲染桩，不在 runner 内；含来源标签与权益通道断言：缺 Key 时全标 Credits 且给出凭据名、连通项按扣减层标注、无 mcpManager 时说明原因；以及 v0.6.0 的两层断言：两小节并列且顺序与抵扣顺序一致、两层各自的真实数字、第一层耗尽转标套餐权益、第一层缺数据时不谎报、视频 10 秒试用按秒显示；v0.6.2 追加：第一层用尽行整行隐去、全部用尽时整节隐去、用尽与取数失败严格区分）。
+在插件目录执行 `npm test`（213 项：compat + relogin + stream + tier-retry + route-guard + model-display + catalog-feed + observer + capability-probe + config-knobs + stream-resilience + probe-integrity + media-safety + budget-merge + mcp-equity + quota-layers + tts，含媒体下载 SSRF/重定向、流内错误分类（Chat 与 Responses 两条路线）、HTTP 429 与额度措辞的优先级、探测完整性、跨实例预算合并、纯文本生图端点回归、MCP 权益通道挂/摘与双通道计费口径、**MCP 派发按真实单位记账（字符/张/秒）与 asr 秒数在 `tools/result` 补记**、两层额度与扣减层判定、**第一层免费额度不虚扣第二层权益（含跨层拆分与周期翻页）**、语音合成落盘与按字符记账）。runner 逐文件串行执行（Windows 上唯一全绿的组合，见 `test/run.mjs` 注释）。另有 `test/client-smoke.mjs` 单独跑（面板渲染桩，不在 runner 内；含来源标签与权益通道断言：缺 Key 时全标 Credits 且给出凭据名、连通项按扣减层标注、无 mcpManager 时说明原因；以及 v0.6.0 的两层断言：两小节并列且顺序与抵扣顺序一致、两层各自的真实数字、第一层耗尽转标套餐权益、第一层缺数据时不谎报、视频 10 秒试用按秒显示；v0.6.2 追加：第一层用尽行整行隐去、全部用尽时整节隐去、用尽与取数失败严格区分）。
 
 下载类用例把 DNS 钉在 mock 上（`pinPublicDns`）：本机 DNS 会把 `*.invalid` 泛解析到
 `198.18.x.x`（RFC 2544 基准段，属 SSRF 闸的内网地址），不钉死就会随网络环境随机失败。
@@ -414,6 +414,37 @@ v0.5.1 起七项权益一一对应七个真实服务，实测全部 `connected`�
 测试使用本机已安装的 DeepSeek Harness 内置运行时与真实 `dsh-llm` 类，不访问网络、不读取个人凭据。其他安装路径可通过 `DSH_TEST_NODE` 和 `DSH_TEST_RUNTIME` 指定。
 
 真实联网验证需单独进行；正常测试不会运行图片或视频生成。
+
+## v0.7.2（2026-11-25，两层额度分开记账 + MCP 派发按真实单位计费）
+
+**背景**：2026-11-24 全量审计里两项「真金白银」缺陷（Q4/Q5）。两者都让本地余额与上游真实扣费
+脱节：一个**虚扣**（免费额度还在却把套餐权益扣光、误摘工具回落付费），一个**少记**
+（合成 2 万字符只记 1，权益其实早已耗尽却仍判有余量，超出部分走套餐外 88 折后付费）。
+
+**Q4 — 第一层与第二层各自记账**（`lib/budget.js`）：
+官方抵扣顺序是「服务自带免费额度 → Token Plan 权益 → 按量后付费」。旧实现两层共用
+`byEquity` 一个计数器，于是第一层的免费用量被记到第二层头上：`equityState` 的
+`remaining = available − sinceFetch` 凭空少掉一截，`mcp-equity` 据此摘掉 MCP 服务、
+`qwen_generate_image/speech` 的预检据此拒绝调用 —— **免费额度还剩很多却开始花 Credits**。
+新增账号级计数器 `byService`：`record()` 先按第一层**剩余量**吃满，溢出的部分才记第二层
+（一次调用可以跨越两层）；`serviceQuotaState` 只读 `byService`，回源基线也取 `byService`；
+跨实例合并三个分支都单独合并它；订阅周期翻页只清第二层（第一层是账号级试用额度，不随周期清零）。
+
+**Q5 — MCP 派发按真实计量单位记账**（`lib/mcp-equity.js`）：
+七项权益单位不同（`gateway.js`）：语音合成按**字符**、语音识别按**秒**、生图按**张**，其余按次。
+旧 guard 一律 `record(key, 1)`，模型直调 `mcp__TextGenerateSpeech__bailian_tts` 合成 2 万字符
+只记 1。新增 `equityUnitsForDispatch(key, exec.arguments)`：tts 取文本长度（与插件自家工具同口径）、
+生图取 `n`（缺省 1，越界收敛到上游 1–4，不拿脏值放大记账）、其余按次。
+asr 的秒数派发时不可知（入参只有音频 URL），先记 1 秒占位，再在宿主
+`tools/result`（冻结的最终结果观察点）里按 `asrSecondsFromResult` 补差额：上游明确时长
+（`duration`/`duration_ms`/句末 `end_time`）优先，否则按转写正文 ÷ 4 字每秒估算；
+只认自己派发过的 `callId`、失败调用与拿不到线索的结果保持占位不猜数，同一调用只补一次，
+`dispose` 撤观察器。字符只数**转写字段**（`results`/`sentences[].text`/内容块正文），
+`request_id` 与块类型标签不算语音内容。
+
+**验证**：`npm test` **213 项全绿**（新增 9 例：第一层还在扣时第二层不得虚扣、一次调用跨层拆分、
+周期翻页第一层不清零；guard 按字符/张/次记账与脏值收敛、asr 秒数补记与去重、失败/未派发/无文本
+不补记、上游明确时长优先、纯函数边界（非 JSON 转写、句级累加、循环引用、向上取整））。
 
 ## v0.7.1（2026-11-25，Chat 路线流内错误分类 + HTTP 429 优先级）
 
