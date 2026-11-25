@@ -5,7 +5,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { apply, Config } from '../index.js';
 import { iterateSse, responsesToDshChunks } from '../lib/responses-sse.js';
-import { streamFailureCode } from '../lib/errors.js';
+import { streamFailureCode, httpFailure } from '../lib/errors.js';
+import { chatToDshChunks } from '../lib/chat.js';
 import { detectSite, SITE_ENDPOINTS } from '../lib/site.js';
 
 const enc = new TextEncoder();
@@ -73,6 +74,48 @@ test('response.cancelled 仍报 ABORTED（用户取消不该被当成上游故�
     if (chunk.type === 'finish' && chunk.reason?.kind === 'error') code = chunk.reason.failure.code;
   }
   assert.equal(code, 'ABORTED');
+});
+
+// —— 2026-11-24 审计 Q1：Chat 路线流内错误漏修（Responses 侧 11-18 已修，chat.js:144 仍写死 400）——
+
+test('Chat 流内 rate_limit_exceeded / server_error 归到可重试码（Q1）', async () => {
+  for (const [code, expected] of [['rate_limit_exceeded', 'RATE_LIMIT'], ['server_error', 'SERVER'], ['request_timeout', 'TIMEOUT']]) {
+    const body = sseBody(`data: {"error":{"code":"${code}","message":"upstream says no"}}\n\n`);
+    await assert.rejects(
+      () => (async () => { for await (const _ of chatToDshChunks(body, undefined)) { /* drain */ } })(),
+      (error) => { assert.equal(error.code, expected, `${code} 应映射 ${expected}`); assert.ok(RETRYABLE.has(error.code)); return true; },
+    );
+  }
+});
+
+test('Chat 流内额度/认证错误仍不可重试（Q1 别把终局错误也重试）', async () => {
+  for (const [code, expected] of [['insufficient_quota', 'QUOTA'], ['invalid_api_key', 'AUTH']]) {
+    const body = sseBody(`data: {"error":{"code":"${code}","message":"terminal"}}\n\n`);
+    await assert.rejects(
+      () => (async () => { for await (const _ of chatToDshChunks(body, undefined)) { /* drain */ } })(),
+      (error) => { assert.equal(error.code, expected); assert.ok(!RETRYABLE.has(error.code)); return true; },
+    );
+  }
+});
+
+// —— 2026-11-24 审计 Q2：HTTP 429 + quota 措辞被误判 QUOTA（quota 启发式排在 429 之前）——
+
+test('HTTP 429 即使 body 带 quota 措辞也判 RATE_LIMIT（Q2）', () => {
+  // 网关确实存在 code/message 不一致报文（流内侧 11-18 就是为此修的）。
+  // HTTP 429 是结构化状态、可靠；body 是散文。退避一下就能重试的限流不该被当终局。
+  assert.equal(httpFailure(429, 'rate limit reached, quota exceeded, slow down'), 'RATE_LIMIT');
+  assert.equal(httpFailure(429, '请求过于频繁，额度耗尽请稍后再试'), 'RATE_LIMIT');
+  assert.ok(RETRYABLE.has(httpFailure(429, 'quota exceeded')));
+});
+
+test('HTTP 429 + 明确额度结构化字样仍判 QUOTA；非 429 的额度判定不变（Q2 护栏）', () => {
+  assert.equal(httpFailure(429, 'insufficient_quota'), 'QUOTA');
+  assert.equal(httpFailure(429, 'insufficient quota: billing account suspended'), 'QUOTA');
+  assert.equal(httpFailure(400, '余额不足'), 'QUOTA');
+  assert.equal(httpFailure(400, 'quota exceeded'), 'QUOTA');
+  assert.equal(httpFailure(200, '额度耗尽'), 'QUOTA');
+  assert.equal(httpFailure(429, 'too many requests'), 'RATE_LIMIT');
+  assert.equal(httpFailure(401, 'anything'), 'AUTH');
 });
 
 // —— P1-5：SSE 单事件长度上限 ——

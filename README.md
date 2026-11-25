@@ -399,7 +399,7 @@ v0.5.1 起七项权益一一对应七个真实服务，实测全部 `connected`�
 
 ### 本地验证
 
-在插件目录执行 `npm test`（200 项：compat + relogin + stream + tier-retry + route-guard + model-display + catalog-feed + observer + capability-probe + config-knobs + stream-resilience + probe-integrity + media-safety + budget-merge + mcp-equity + quota-layers + tts，含媒体下载 SSRF/重定向、流内错误分类、探测完整性、跨实例预算合并、纯文本生图端点回归、MCP 权益通道挂/摘与双通道计费口径、两层额度与扣减层判定、语音合成落盘与按字符记账）。runner 逐文件串行执行（Windows 上唯一全绿的组合，见 `test/run.mjs` 注释）。另有 `test/client-smoke.mjs` 单独跑（面板渲染桩，不在 runner 内；含来源标签与权益通道断言：缺 Key 时全标 Credits 且给出凭据名、连通项按扣减层标注、无 mcpManager 时说明原因；以及 v0.6.0 的两层断言：两小节并列且顺序与抵扣顺序一致、两层各自的真实数字、第一层耗尽转标套餐权益、第一层缺数据时不谎报、视频 10 秒试用按秒显示；v0.6.2 追加：第一层用尽行整行隐去、全部用尽时整节隐去、用尽与取数失败严格区分）。
+在插件目录执行 `npm test`（204 项：compat + relogin + stream + tier-retry + route-guard + model-display + catalog-feed + observer + capability-probe + config-knobs + stream-resilience + probe-integrity + media-safety + budget-merge + mcp-equity + quota-layers + tts，含媒体下载 SSRF/重定向、流内错误分类（Chat 与 Responses 两条路线）、HTTP 429 与额度措辞的优先级、探测完整性、跨实例预算合并、纯文本生图端点回归、MCP 权益通道挂/摘与双通道计费口径、两层额度与扣减层判定、语音合成落盘与按字符记账）。runner 逐文件串行执行（Windows 上唯一全绿的组合，见 `test/run.mjs` 注释）。另有 `test/client-smoke.mjs` 单独跑（面板渲染桩，不在 runner 内；含来源标签与权益通道断言：缺 Key 时全标 Credits 且给出凭据名、连通项按扣减层标注、无 mcpManager 时说明原因；以及 v0.6.0 的两层断言：两小节并列且顺序与抵扣顺序一致、两层各自的真实数字、第一层耗尽转标套餐权益、第一层缺数据时不谎报、视频 10 秒试用按秒显示；v0.6.2 追加：第一层用尽行整行隐去、全部用尽时整节隐去、用尽与取数失败严格区分）。
 
 下载类用例把 DNS 钉在 mock 上（`pinPublicDns`）：本机 DNS 会把 `*.invalid` 泛解析到
 `198.18.x.x`（RFC 2544 基准段，属 SSRF 闸的内网地址），不钉死就会随网络环境随机失败。
@@ -414,6 +414,33 @@ v0.5.1 起七项权益一一对应七个真实服务，实测全部 `connected`�
 测试使用本机已安装的 DeepSeek Harness 内置运行时与真实 `dsh-llm` 类，不访问网络、不读取个人凭据。其他安装路径可通过 `DSH_TEST_NODE` 和 `DSH_TEST_RUNTIME` 指定。
 
 真实联网验证需单独进行；正常测试不会运行图片或视频生成。
+
+## v0.7.1（2026-11-25，Chat 路线流内错误分类 + HTTP 429 优先级）
+
+**背景**：2026-11-24 全量审计（48 项发现）里两处「一行级漏修」——同一个问题在 Responses 路线
+2026-11-18 已修，Chat 路线与 HTTP 分类函数漏了同款防护。两者都直接决定 **llm-retry 会不会重试**：
+宿主 `DEFAULT_RETRYABLE_CODES` 只认 `EMPTY_RESPONSE / RATE_LIMIT / SERVER / TIMEOUT / TRANSPORT`，
+错分成 `PROVIDER_ERROR` 或 `QUOTA` 就是终局，一次网络抖动/限流即整轮失败。
+
+**Q1 — Chat 流内错误不再写死 HTTP 400**（`lib/chat.js`）：
+旧代码 `if (chunk?.error) throw new LlmError(..., httpFailure(400, ...))`，于是上游流内
+`rate_limit_exceeded`、`server_error` 全部落 `PROVIDER_ERROR`（400 既不是 429 也不是 5xx），
+llm-retry 一次都不重试。改为与 Responses 路线同款的 `streamFailureCode(chunk.error)`：
+**结构化 `code`/`type` 优先**（`insufficient_quota`/`billing_*`→QUOTA、`rate_limit*`→RATE_LIMIT、
+`timeout*`→TIMEOUT、`server*`→SERVER），code 不认识才退到文本启发式。
+
+**Q2 — HTTP 429 先于 quota 文本启发式**（`lib/errors.js`）：
+旧顺序把 `isQuotaExceededError(body)` 排在 `status === 429` 之前，而网关存在
+**429 限流但 body 带 "quota exceeded" 措辞**的报文（code/message 不一致），被误判成终局 QUOTA：
+不重试，且面板显示「额度耗尽」误导用户。改为 429 先判 `RATE_LIMIT`；只有 body 以明确的额度
+结构化字样开头（`insufficient_quota` / `insufficient quota` / `billing_*`，与流内侧枚举同款词首匹配）
+才判 QUOTA——那是真终局。400 + 「余额不足/额度耗尽」等中文文案仍判 QUOTA，行为不变。
+
+**验证**：`npm test` **204 项全绿**（`stream-resilience.test.js` 新增 4 例：Chat 流内
+`rate_limit_exceeded`/`server_error`/`request_timeout` 归到可重试码、`insufficient_quota`/`invalid_api_key`
+仍为终局；HTTP 429 + quota 措辞（含中文「额度耗尽请稍后再试」）→ RATE_LIMIT，429 +
+`insufficient_quota`/`insufficient quota: billing…` → QUOTA，400 + 「余额不足」/`quota exceeded`
+与 200 + 「额度耗尽」仍 → QUOTA）。
 
 ## v0.7.0（2026-11-24，语音合成工具：自动落盘 + 给文件）
 
