@@ -5,6 +5,7 @@ import {
   normalizeMcpMode, shouldMountService, suppressedBuiltins,
   serverOfToolName, equityKeysOfService, mcpToolPrefix,
   registerEquityMcp, filterMcpShadowedBuiltins, equityChannel,
+  equityUnitsForDispatch, asrSecondsFromResult,
 } from '../lib/mcp-equity.js';
 
 /**
@@ -27,6 +28,9 @@ function makeHost({ key = null, states = {}, defs = [], managerLate = false } = 
     states,
     defs,
     emit(ref) { for (const fn of listeners.get('credentials/reference-updated') ?? []) fn(ref); },
+    /** 宿主 dsh-tools/lib/pipeline.js notifyResult：(exec, result)，result.value 是工具原始返回。 */
+    emitResult(exec, result) { for (const fn of listeners.get('tools/result') ?? []) fn(exec, result); },
+    resultListenerCount() { return (listeners.get('tools/result') ?? []).length; },
     ctx: {
       get(name) {
         if (name === 'mcpManager') {
@@ -215,7 +219,7 @@ test('storing the key later mounts the channel without a restart', async () => {
 test('the guard counts MCP dispatches optimistically and never rejects a call', async () => {
   const recorded = [];
   const host = makeHost({ key: 'sk-fixture' });
-  const mcp = registerEquityMcp(host.ctx, { budget: budgetOf({ search_pro: 10, vertical_search: 10 }, recorded) });
+  const mcp = registerEquityMcp(host.ctx, { budget: budgetOf({ search_pro: 10, vertical_search: 10, tts: 10000, asr: 18000 }, recorded) });
   await mcp.rearm();
   assert.equal(host.guards.length, 1);
   const guard = host.guards[0];
@@ -229,7 +233,7 @@ test('the guard counts MCP dispatches optimistically and never rejects a call', 
   // 语音两项没有服务端内置工具类型，只能按权益键记账；漏了映射会被静默丢弃。
   assert.equal(guard({ name: 'mcp__TextGenerateSpeech__bailian_tts' }), undefined);
   assert.equal(guard({ name: 'mcp__SpeechGenerateText__bailian_asr' }), undefined);
-  assert.deepEqual(recorded.slice(2), [['tts', 1], ['asr', 1]], '语音权益也要记上');
+  assert.deepEqual(recorded.slice(2), [['tts', 1], ['asr', 1]], '语音权益也要记上（无实参时退回按次估算）');
   // 非 MCP 工具、未注册的服务都不记账，也一律放行。
   assert.equal(guard({ tool: { name: 'web_search' } }), undefined);
   assert.equal(guard({ tool: { name: 'mcp__Unknown__x' } }), undefined);
@@ -303,4 +307,133 @@ test('dispose unmounts every service and stays idempotent', async () => {
   mcp.dispose();
   mcp.refresh();
   assert.equal(host.registered.size, 0, 'dispose 后 refresh 不得复活服务');
+});
+test('Q5 MCP guard 按真实计量单位记账：tts 字符 / 生图 张 / 搜索 次', async () => {
+  const recorded = [];
+  const host = makeHost({ key: 'sk-fixture' });
+  const mcp = registerEquityMcp(host.ctx, {
+    budget: budgetOf({ tts: 10000, image_generation: 50, search_pro: 100 }, recorded),
+  });
+  await mcp.rearm();
+  const guard = host.guards[0];
+  // 上游真实 schema（本会话对宿主 MCP 服务实调确认）：语音是 text，生图是 prompt + n。
+  const text = '你好'.repeat(50); // 100 字符
+  guard({ name: 'mcp__TextGenerateSpeech__bailian_tts', callId: 'c1', arguments: { text, voice: '温柔女声' } });
+  assert.deepEqual(recorded.at(-1), ['tts', 100], '按字符计：合成 100 字符要记 100，不是 1');
+  guard({ name: 'mcp__TextGenerateImage__bailian_image_gen', callId: 'c2', arguments: { prompt: 'p', n: 3 } });
+  assert.deepEqual(recorded.at(-1), ['image_generation', 3], '按张计：一次三张要记 3');
+  guard({ name: 'mcp__TextGenerateImage__bailian_image_gen', callId: 'c3', arguments: { prompt: 'p' } });
+  assert.deepEqual(recorded.at(-1), ['image_generation', 1], 'n 缺省按一张');
+  guard({ name: 'mcp__EnhancedSearch__search_pro', callId: 'c4', arguments: { query: 'q' } });
+  assert.deepEqual(recorded.at(-1), ['search_pro', 1], '按次计的服务不受影响');
+  // 越界/非数字的 n 不许放大记账（上游会拒或忽略，本地按合法范围收敛）。
+  guard({ name: 'mcp__TextGenerateImage__bailian_image_gen', callId: 'c5', arguments: { prompt: 'p', n: 99 } });
+  assert.deepEqual(recorded.at(-1), ['image_generation', 4], 'n 超上限按上游上限 4 记');
+  mcp.dispose();
+});
+
+// Q5 的另一半：asr 按**秒**计，但入参只有音频 URL，派发时无法知道时长（先记 1 秒占位）。
+// 上游 MCP 响应实测（2026-11-25 本会话实调）只有 { request_id, results:[转写文本] }，没有时长字段，
+// 所以真实秒数在 tools/result 里按转写文本量补记差额；一律停在 1 秒会让 5 小时额度永远用不完。
+test('Q5 asr 秒数在 tools/result 里补记：转写 400 字 ≈ 100 秒，而不是永远 1 秒', async () => {
+  const recorded = [];
+  const host = makeHost({ key: 'sk-fixture' });
+  const mcp = registerEquityMcp(host.ctx, { budget: budgetOf({ asr: 18000 }, recorded) });
+  await mcp.rearm();
+  const guard = host.guards[0];
+  const exec = { name: 'mcp__SpeechGenerateText__bailian_speech_to_text', callId: 'a1', arguments: { file_urls: ['https://x.test/a.wav'] } };
+  guard(exec);
+  assert.deepEqual(recorded, [['asr', 1]], '派发时先记 1 秒占位');
+  // 宿主真实形状：MCP 适配定义把上游 JSON 放在 content[].text 里（没有 structuredContent）。
+  const transcript = '语音识别'.repeat(100); // 400 个汉字
+  host.emitResult(exec, { isError: false, value: { content: [{ type: 'text', text: JSON.stringify({ request_id: 'r1', results: [transcript] }) }] } });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(recorded, [['asr', 1], ['asr', 99]], '补记到 100 秒（差额 99），不是再加一次 1');
+  // 同一次调用只校正一次：宿主可能重复投递，重复补记会把额度扣穿。
+  host.emitResult(exec, { isError: false, value: { content: [{ type: 'text', text: JSON.stringify({ results: [transcript] }) }] } });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(recorded.length, 2, '同一 callId 不得重复补记');
+  mcp.dispose();
+});
+
+test('Q5 asr 校正只认自己派发过的调用，失败调用与无文本结果不补记', async () => {
+  const recorded = [];
+  const host = makeHost({ key: 'sk-fixture' });
+  const mcp = registerEquityMcp(host.ctx, { budget: budgetOf({ asr: 18000 }, recorded) });
+  await mcp.rearm();
+  const guard = host.guards[0];
+  const name = 'mcp__SpeechGenerateText__bailian_speech_to_text';
+  // 失败调用：保持占位，不按空文本补记（口径由官方回源对齐）。
+  guard({ name, callId: 'e1', arguments: {} });
+  host.emitResult({ name, callId: 'e1' }, { isError: true, error: new Error('boom') });
+  // 没经 guard 记过账的调用（例如挂载前就派发的）不得凭空补记。
+  host.emitResult({ name, callId: 'never-dispatched' }, { isError: false, value: { content: [{ type: 'text', text: JSON.stringify({ results: ['字'.repeat(400)] }) }] } });
+  // 成功但没有转写文本（上游只回 request_id）：不猜数。
+  guard({ name, callId: 'e2', arguments: {} });
+  host.emitResult({ name, callId: 'e2' }, { isError: false, value: { content: [{ type: 'text', text: JSON.stringify({ request_id: 'r' }) }] } });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(recorded, [['asr', 1], ['asr', 1]], '只有两次派发占位，没有任何补记');
+  mcp.dispose();
+  assert.equal(host.resultListenerCount(), 0, 'dispose 必须撤掉 tools/result 观察器');
+});
+
+test('Q5 asr 上游若给出明确时长就按它记账，不用估算', async () => {
+  const recorded = [];
+  const host = makeHost({ key: 'sk-fixture' });
+  const mcp = registerEquityMcp(host.ctx, { budget: budgetOf({ asr: 18000 }, recorded) });
+  await mcp.rearm();
+  const guard = host.guards[0];
+  const name = 'mcp__SpeechGenerateText__bailian_speech_to_text';
+  guard({ name, callId: 'd1', arguments: {} });
+  // 秒：duration；毫秒：end_time（paraformer 句末时间即音频长度）。明确值优先于文本估算。
+  host.emitResult({ name, callId: 'd1' }, { isError: false, value: { structuredContent: { duration: 42, results: ['字'.repeat(400)] } } });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(recorded.at(-1), ['asr', 41], '上游说 42 秒就记 42 秒');
+  guard({ name, callId: 'd2', arguments: {} });
+  host.emitResult({ name, callId: 'd2' }, { isError: false, value: { structuredContent: { sentences: [{ text: 'x', end_time: 90_000 }] } } });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(recorded.at(-1), ['asr', 89], 'end_time 是毫秒，90000ms = 90 秒');
+  mcp.dispose();
+});
+
+// 纯函数边界：上游形状各家不同，估算口径必须只在**转写正文**上数字符，
+// 且拿不到任何线索时返回 null（保持占位、不猜数），不能凭空造出秒数。
+test('Q5 asrSecondsFromResult 只数转写正文，拿不到线索就不猜数', () => {
+  const text = '字'.repeat(400);
+  // 上游 JSON 整段塞在 content[].text 里（宿主真实形状）：request_id 不算语音内容。
+  assert.equal(asrSecondsFromResult({ content: [{ type: 'text', text: JSON.stringify({ request_id: 'r'.repeat(64), results: [text] }) }] }), 100);
+  // 纯文本转写（没有 JSON 包装）也要认。
+  assert.equal(asrSecondsFromResult({ content: [{ type: 'text', text }] }), 100);
+  // 句级结构：sentences[].text 逐句累加；end_time 明确值优先。
+  assert.equal(asrSecondsFromResult({ structuredContent: { sentences: [{ text: '字'.repeat(200) }, { text: '字'.repeat(200) }] } }), 100);
+  // 只有 request_id / 空结果 / 非对象 → null（不猜数）。
+  assert.equal(asrSecondsFromResult({ content: [{ type: 'text', text: JSON.stringify({ request_id: 'r' }) }] }), null);
+  assert.equal(asrSecondsFromResult({ content: [] }), null);
+  assert.equal(asrSecondsFromResult(undefined), null);
+  assert.equal(asrSecondsFromResult({ structuredContent: { results: [] } }), null);
+  // 明确时长的三种写法都认，且优先于文本估算。
+  assert.equal(asrSecondsFromResult({ structuredContent: { duration: 7, results: [text] } }), 7);
+  assert.equal(asrSecondsFromResult({ structuredContent: { duration_ms: 7_400 } }), 8, '毫秒向上取整');
+  assert.equal(asrSecondsFromResult({ structuredContent: { sentences: [{ end_time: 1_000 }, { end_time: 12_000 }] } }), 12, '取最大句末时间');
+  // 循环引用不得栈溢出（上游 JSON 解开后理论上无环，但结构化内容可能自引用）。
+  const cyclic = { results: [text] };
+  cyclic.self = cyclic;
+  assert.equal(asrSecondsFromResult({ structuredContent: cyclic }), 100);
+  // 估算向上取整：401 字 → 101 秒（宁可略微高估，不让余额虚高）。
+  assert.equal(asrSecondsFromResult({ structuredContent: { results: ['字'.repeat(401)] } }), 101);
+});
+
+test('Q5 equityUnitsForDispatch 的单位口径与脏值收敛', () => {
+  assert.equal(equityUnitsForDispatch('tts', { text: '你好世界' }), 4);
+  assert.equal(equityUnitsForDispatch('tts', {}), 1, '拿不到文本时退回按次');
+  assert.equal(equityUnitsForDispatch('tts', { text: 123 }), 1, '非字符串不当字符数');
+  assert.equal(equityUnitsForDispatch('image_generation', { n: 2 }), 2);
+  assert.equal(equityUnitsForDispatch('image_generation', { n: 0 }), 1);
+  assert.equal(equityUnitsForDispatch('image_generation', { n: -5 }), 1);
+  assert.equal(equityUnitsForDispatch('image_generation', { n: 2.9 }), 2, '小数取整不放大');
+  assert.equal(equityUnitsForDispatch('image_generation', { n: '3' }), 3, '数字字符串可接受');
+  assert.equal(equityUnitsForDispatch('image_generation', { n: NaN }), 1);
+  assert.equal(equityUnitsForDispatch('search_pro', { query: 'x'.repeat(500) }), 1, '按次计的服务不受入参长度影响');
+  assert.equal(equityUnitsForDispatch('asr', { file_urls: ['https://x/a.wav'] }), 1, 'asr 派发时只有占位');
+  assert.equal(equityUnitsForDispatch('tts', undefined), 1);
 });

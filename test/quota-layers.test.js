@@ -223,3 +223,74 @@ test("L9 跨实例合并：两层各自比新鲜度，第一层不随订阅周�
   assert.deepEqual(after.byEquity, {}, "第二层本地计数随周期清零");
   assert.equal(after.serviceQuotas?.[0]?.available, 99, "第一层跨周期保留（试用额度不按月发放）");
 });
+
+test("L10 第一层还在扣时，第二层不得虚扣（Q4：共用计数器会把免费用量记到套餐头上）", (t) => {
+  const { filePath, logger, readState } = setup(t);
+  const a = new HarnessBudget({ filePath, logger });
+  a.setTierFallback("test");
+  // 2026-11-25 真机快照形状：第一层图像 99/100 还有余量，第二层 20/20 满格。
+  a.setServiceQuotas([serviceRow("image_generation", 99, 100, "张"), serviceRow("tts", 9512, 10000, "字符")]);
+  a.setEquities([
+    { key: "image_generation", unit: "张", available: 20, total: 20 },
+    { key: "tts", unit: "字符", available: 10000, total: 10000 },
+  ]);
+  // 第一层扣 20 张：第二层此刻确实一分没动，remaining 必须还是 20。
+  for (let i = 0; i < 20; i += 1) a.record("image_generation", 1);
+  const equity = a.equityState("image_generation");
+  assert.equal(equity.remaining, 20, "第一层的消耗不得记到第二层头上");
+  assert.equal(equity.used, 0);
+  assert.equal(equity.sinceFetch, 0);
+  const service = a.serviceQuotaState("image_generation");
+  assert.equal(service.remaining, 79, "第一层要如实扣掉这 20 张");
+  assert.equal(service.sinceFetch, 20);
+  // 按字符计的第一层同理（TTS 一次 4756 字符 ×2 = 第一层 9512 刚好扣完）。
+  a.record("tts", 4756);
+  a.record("tts", 4756);
+  assert.equal(a.equityState("tts").remaining, 10000, "字符权益同样不得虚扣");
+  assert.equal(a.serviceQuotaState("tts").remaining, 0);
+  assert.equal(a.chargeLayer("tts"), "equity", "第一层扣完才开始扣第二层");
+  // 第一层扣完之后，后续调用才真正落到第二层（这里把第一层剩下的 79 张用光）。
+  a.setServiceQuotas([serviceRow("image_generation", 0, 100, "张"), serviceRow("tts", 9512, 10000, "字符")]);
+  a.record("image_generation", 1);
+  assert.equal(a.equityState("image_generation").remaining, 19);
+  assert.equal(a.serviceQuotaState("image_generation").remaining, 0, "第一层不再继续扣");
+  const disk = readState();
+  assert.equal(disk.byEquity.image_generation, 1, "第二层计数器只记真正扣到第二层的量");
+  assert.equal(disk.byService.image_generation, 20, "第一层计数器独立记账并落盘");
+  assert.equal(disk.byService.tts, 9512);
+});
+
+test("L11 一次调用跨越两层：按第一层剩余量拆分，溢出的部分才记第二层（Q4）", (t) => {
+  const { filePath, logger, readState } = setup(t);
+  const a = new HarnessBudget({ filePath, logger });
+  a.setTierFallback("test");
+  // 第一层只剩 30 字符，本次合成 100 字符：官方会先扣光 30，再扣第二层 70。
+  a.setServiceQuotas([serviceRow("tts", 30, 10000, "字符")]);
+  a.setEquities([{ key: "tts", unit: "字符", available: 10000, total: 10000 }]);
+  a.record("tts", 100);
+  assert.equal(a.serviceQuotaState("tts").remaining, 0, "第一层被扣光");
+  assert.equal(a.equityState("tts").remaining, 9930, "只有溢出的 70 字符记到第二层");
+  const disk = readState();
+  assert.equal(disk.byService.tts, 30);
+  assert.equal(disk.byEquity.tts, 70);
+});
+
+test("L12 订阅周期翻页：第一层本地计数是账号级，不得跟着第二层一起清零（Q4）", (t) => {
+  const { filePath, logger, readState } = setup(t);
+  const a = new HarnessBudget({ filePath, logger });
+  a.setTierFallback("test");
+  a.setServiceQuotas([serviceRow("image_generation", 99, 100, "张")]);
+  a.setEquities([{ key: "image_generation", unit: "张", available: 20, total: 20 }]);
+  a.record("image_generation", 3);
+  assert.equal(readState().byService.image_generation, 3);
+  // 周期锚点推到过去 → 下一次记账触发 rollover。
+  const rolled = readState();
+  rolled.periodAnchor = Date.now() - DAY_MS;
+  fs.writeFileSync(filePath, JSON.stringify(rolled));
+  const c = new HarnessBudget({ filePath, logger });
+  c.setTierFallback("test");
+  c.recordRequest();
+  const after = readState();
+  assert.deepEqual(after.byEquity, {}, "第二层随周期清零");
+  assert.equal(after.byService.image_generation, 3, "第一层是账号级试用额度，跨周期保留");
+});
