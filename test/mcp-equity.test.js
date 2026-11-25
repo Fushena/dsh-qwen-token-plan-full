@@ -170,12 +170,13 @@ test('exhausting a quota unmounts its service and hands the capability back to b
   const mcp = registerEquityMcp(host.ctx, { budget: budgetOf(remaining) });
   await mcp.rearm();
   assert.ok(mcp.readyServices().includes('EnhancedSearch'));
-  assert.deepEqual(filterMcpShadowedBuiltins(['web_search', 'web_extractor'], mcp).tools, ['web_extractor']);
+  const requestTools = [{ name: 'mcp__EnhancedSearch__search_pro' }];
+  assert.deepEqual(filterMcpShadowedBuiltins(['web_search', 'web_extractor'], mcp, requestTools).tools, ['web_extractor']);
 
   remaining.search_pro = 0;
   mcp.refresh();
   assert.ok(!mcp.mountedServices().includes('EnhancedSearch'), '增强搜索额度耗尽 → 摘 EnhancedSearch');
-  assert.deepEqual(filterMcpShadowedBuiltins(['web_search', 'web_extractor'], mcp).tools, ['web_search', 'web_extractor']);
+  assert.deepEqual(filterMcpShadowedBuiltins(['web_search', 'web_extractor'], mcp, requestTools).tools, ['web_search', 'web_extractor']);
   assert.equal(mcp.usesEquity('image_generation'), true, '生图还有余额，不受影响');
   assert.equal(equityChannel('search_pro', mcp.status()), 'credits');
   mcp.dispose();
@@ -188,7 +189,7 @@ test('a service that is registered but not connected neither shadows built-ins n
   await mcp.rearm();
   assert.ok(mcp.mountedServices().includes('EnhancedSearch'), '注册仍在（宿主会自己重连）');
   assert.ok(!mcp.readyServices().includes('EnhancedSearch'), '但不算就绪');
-  assert.deepEqual(filterMcpShadowedBuiltins(['web_search'], mcp).tools, ['web_search']);
+  assert.deepEqual(filterMcpShadowedBuiltins(['web_search'], mcp, [{ name: 'mcp__EnhancedSearch__search_pro' }]).tools, ['web_search']);
   assert.equal(equityChannel('search_pro', mcp.status()), 'credits');
   assert.equal(equityChannel('image_generation', mcp.status()), 'equity');
   mcp.dispose();

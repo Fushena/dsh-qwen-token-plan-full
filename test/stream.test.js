@@ -50,6 +50,21 @@ async function withServer(handler, run) {
 
 const pump = async (stream) => { for await (const chunk of stream) void chunk; };
 
+test('SSE comment keep-alives reset the adapter idle timeout', async () => {
+  await withServer((req, res) => {
+    res.writeHead(200, SSE);
+    res.write(': keep-alive\n\n');
+    const timer = setInterval(() => res.write(': keep-alive\n\n'), 25);
+    const done = setTimeout(() => {
+      send(res, { type: 'response.completed', response: {} });
+      res.end();
+    }, 400);
+    res.on('close', () => { clearInterval(timer); clearTimeout(done); });
+  }, async (port) => {
+    await pump(makeAdapter(port, 175).stream({ model: model.id, messages: [] }));
+  });
+});
+
 test('空闲超时：慢但持续的流不会被掐断，卡死会及时 TIMEOUT，取消会 ABORTED', async () => {
   // A. 9 个 delta 每 150ms（约 1.35s，是 400ms 阈值的 3 倍多）+ 正常 done/completed。
   await withServer((req, res) => {

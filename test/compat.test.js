@@ -137,6 +137,40 @@ test('Chat tool-call fragments assemble and replay through DSH',async()=>{
   ])));
   const a=assemble(chunks);assert.equal(a.finish.kind,'tool-calls');assert.equal(a.blocks()[0].arguments,'{"q":"x"}');
 });
+
+test('Chat tool fragments without indexes reuse their call without colliding with indexed calls', async () => {
+  const part = (call) => ({ choices: [{ delta: { tool_calls: [call] } }] });
+  const chunks = await collect(chatToDshChunks(sse([
+    part({ id: 'call_a', function: { name: 'a', arguments: '{"a":' } }),
+    part({ function: { arguments: '1}' } }),
+    part({ index: 0, id: 'call_b', function: { name: 'b', arguments: '{"b":' } }),
+    part({ id: 'call_b', function: { arguments: '2}' } }),
+    { choices: [{ delta: {}, finish_reason: 'tool_calls' }] },
+  ])));
+  const calls = assemble(chunks).blocks();
+  assert.deepEqual(calls.map(({ id, name, arguments: args }) => [id, name, JSON.parse(args)]),
+    [['call_a', 'a', { a: 1 }], ['call_b', 'b', { b: 2 }]]);
+});
+
+test('Qwen only hands built-in search to MCP when the request offers that service tool', async () => {
+  const requests = [];
+  const adapter = new QwenTokenPlanAdapter({
+    ctx: { get: () => ({ resolve: async () => ({ value: 'fixture' }) }) },
+    catalog: { find: () => qwen }, providerId: 'test', displayName: 'test',
+    apiKeyEnv: 'TEST', endpoint: 'https://example.invalid/responses', pluginName: 'test',
+    harnessMode: normalizeHarnessMode(['web_search']),
+    mcp: { readyServices: () => ['EnhancedSearch'] },
+    fetchImpl: async (_url, init) => {
+      requests.push(JSON.parse(init.body).tools);
+      return new Response(sse([{ type: 'response.completed', response: {} }]));
+    },
+  });
+  const mcpTool = { ...tool, name: 'mcp__EnhancedSearch__search_pro' };
+  await collect(adapter.stream(opts()));
+  await collect(adapter.stream(opts({ tools: [mcpTool] })));
+  assert.deepEqual(requests[0], [{ type: 'web_search' }]);
+  assert.deepEqual(requests[1].map(({ type, name }) => [type, name]), [['function', mcpTool.name]]);
+});
 const sseData = (event) => `data: ${JSON.stringify(event)}\r\n\r\n`;
 
 for (const [protocol, parse, payload] of [

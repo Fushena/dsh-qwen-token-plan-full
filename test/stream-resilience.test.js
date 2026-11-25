@@ -111,6 +111,9 @@ test('HTTP 429 即使 body 带 quota 措辞也判 RATE_LIMIT（Q2）', () => {
 test('HTTP 429 + 明确额度结构化字样仍判 QUOTA；非 429 的额度判定不变（Q2 护栏）', () => {
   assert.equal(httpFailure(429, 'insufficient_quota'), 'QUOTA');
   assert.equal(httpFailure(429, 'insufficient quota: billing account suspended'), 'QUOTA');
+  assert.equal(httpFailure(429, '{"error":{"code":"insufficient_quota"}}'), 'QUOTA');
+  assert.equal(httpFailure(429, '{"code":"insufficient_quota"}'), 'QUOTA');
+  assert.equal(httpFailure(429, '{"error":{"code":"rate_limit_exceeded","message":"insufficient_quota"}}'), 'RATE_LIMIT');
   assert.equal(httpFailure(400, '余额不足'), 'QUOTA');
   assert.equal(httpFailure(400, 'quota exceeded'), 'QUOTA');
   assert.equal(httpFailure(200, '额度耗尽'), 'QUOTA');
