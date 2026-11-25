@@ -111,11 +111,26 @@ test('HTTP 429 即使 body 带 quota 措辞也判 RATE_LIMIT（Q2）', () => {
 test('HTTP 429 + 明确额度结构化字样仍判 QUOTA；非 429 的额度判定不变（Q2 护栏）', () => {
   assert.equal(httpFailure(429, 'insufficient_quota'), 'QUOTA');
   assert.equal(httpFailure(429, 'insufficient quota: billing account suspended'), 'QUOTA');
+  assert.equal(httpFailure(429, '{"error":{"code":"insufficient_quota"}}'), 'QUOTA');
+  assert.equal(httpFailure(429, '{"code":"insufficient_quota"}'), 'QUOTA');
+  assert.equal(httpFailure(429, '{"error":{"code":"rate_limit_exceeded","message":"insufficient_quota"}}'), 'RATE_LIMIT');
   assert.equal(httpFailure(400, '余额不足'), 'QUOTA');
   assert.equal(httpFailure(400, 'quota exceeded'), 'QUOTA');
   assert.equal(httpFailure(200, '额度耗尽'), 'QUOTA');
   assert.equal(httpFailure(429, 'too many requests'), 'RATE_LIMIT');
   assert.equal(httpFailure(401, 'anything'), 'AUTH');
+});
+
+// PR 整合复核：JSON 报文里只有 message（没有 code）时不能丢掉 v0.7.1 的文本兜底。
+// 真终局额度耗尽被降级成 RATE_LIMIT，会白白重试两轮再失败，面板也不提示「额度耗尽」。
+test('HTTP 429 的 JSON 报文缺 code 时，仍按 message 认明确额度字样（Q2 整合护栏）', () => {
+  assert.equal(httpFailure(429, '{"error":{"message":"insufficient_quota: billing hard limit reached","type":"requests"}}'), 'QUOTA');
+  assert.equal(httpFailure(429, '{"error":{"message":"insufficient quota: billing account suspended"}}'), 'QUOTA');
+  // 有 code 时 code 优先，message 里的额度措辞不能翻盘。
+  assert.equal(httpFailure(429, '{"error":{"code":"rate_limit_exceeded","message":"insufficient quota"}}'), 'RATE_LIMIT');
+  // 散文式限流仍然可重试。
+  assert.equal(httpFailure(429, '{"error":{"message":"rate limit reached, quota exceeded, slow down"}}'), 'RATE_LIMIT');
+  assert.equal(httpFailure(429, '{"message":"too many requests"}'), 'RATE_LIMIT');
 });
 
 // —— P1-5：SSE 单事件长度上限 ——

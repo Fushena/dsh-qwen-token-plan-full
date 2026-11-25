@@ -399,7 +399,7 @@ v0.5.1 起七项权益一一对应七个真实服务，实测全部 `connected`�
 
 ### 本地验证
 
-在插件目录执行 `npm test`（213 项：compat + relogin + stream + tier-retry + route-guard + model-display + catalog-feed + observer + capability-probe + config-knobs + stream-resilience + probe-integrity + media-safety + budget-merge + mcp-equity + quota-layers + tts，含媒体下载 SSRF/重定向、流内错误分类（Chat 与 Responses 两条路线）、HTTP 429 与额度措辞的优先级、探测完整性、跨实例预算合并、纯文本生图端点回归、MCP 权益通道挂/摘与双通道计费口径、**MCP 派发按真实单位记账（字符/张/秒）与 asr 秒数在 `tools/result` 补记**、两层额度与扣减层判定、**第一层免费额度不虚扣第二层权益（含跨层拆分与周期翻页）**、语音合成落盘与按字符记账）。runner 逐文件串行执行（Windows 上唯一全绿的组合，见 `test/run.mjs` 注释）。另有 `test/client-smoke.mjs` 单独跑（面板渲染桩，不在 runner 内；含来源标签与权益通道断言：缺 Key 时全标 Credits 且给出凭据名、连通项按扣减层标注、无 mcpManager 时说明原因；以及 v0.6.0 的两层断言：两小节并列且顺序与抵扣顺序一致、两层各自的真实数字、第一层耗尽转标套餐权益、第一层缺数据时不谎报、视频 10 秒试用按秒显示；v0.6.2 追加：第一层用尽行整行隐去、全部用尽时整节隐去、用尽与取数失败严格区分）。
+在插件目录执行 `npm test`（219 项：compat + relogin + stream + tier-retry + route-guard + model-display + catalog-feed + observer + capability-probe + config-knobs + stream-resilience + probe-integrity + media-safety + budget-merge + mcp-equity + quota-layers + tts，含媒体下载 SSRF/重定向、流内错误分类（Chat 与 Responses 两条路线）、HTTP 429 与额度措辞的优先级、探测完整性、跨实例预算合并、纯文本生图端点回归、MCP 权益通道挂/摘与双通道计费口径、**MCP 派发按真实单位记账（字符/张/秒）与 asr 秒数在 `tools/result` 补记**、两层额度与扣减层判定、**第一层免费额度不虚扣第二层权益（含跨层拆分与周期翻页）**、语音合成落盘与按字符记账、**Chat 工具调用分片归并（空串 id 不覆盖、并行不污染）、SSE 心跳续命、内置工具让位需本次请求带 MCP 工具**）。runner 逐文件串行执行（Windows 上唯一全绿的组合，见 `test/run.mjs` 注释）。另有 `test/client-smoke.mjs` 单独跑（面板渲染桩，不在 runner 内；含来源标签与权益通道断言：缺 Key 时全标 Credits 且给出凭据名、连通项按扣减层标注、无 mcpManager 时说明原因；以及 v0.6.0 的两层断言：两小节并列且顺序与抵扣顺序一致、两层各自的真实数字、第一层耗尽转标套餐权益、第一层缺数据时不谎报、视频 10 秒试用按秒显示；v0.6.2 追加：第一层用尽行整行隐去、全部用尽时整节隐去、用尽与取数失败严格区分）。
 
 下载类用例把 DNS 钉在 mock 上（`pinPublicDns`）：本机 DNS 会把 `*.invalid` 泛解析到
 `198.18.x.x`（RFC 2544 基准段，属 SSRF 闸的内网地址），不钉死就会随网络环境随机失败。
@@ -414,6 +414,29 @@ v0.5.1 起七项权益一一对应七个真实服务，实测全部 `connected`�
 测试使用本机已安装的 DeepSeek Harness 内置运行时与真实 `dsh-llm` 类，不访问网络、不读取个人凭据。其他安装路径可通过 `DSH_TEST_NODE` 和 `DSH_TEST_RUNTIME` 指定。
 
 真实联网验证需单独进行；正常测试不会运行图片或视频生成。
+
+## v0.7.3（2026-11-25，整合 codex PR #2：工具调用归并 + 心跳续命 + 内置工具让位收窄）
+
+**来源**：整合 GitHub PR #2（`codex/dsh-adapter-review-fixes`），并在整合复核中修掉 PR 自带的两处缺陷、
+补回一处被 PR 削弱的既有护栏。
+
+- **Chat 路线 tool_calls 归并（审计 Q13 收口）**：分片按 `index` + `id` 双表归并，`id` 晚到不再用占位
+  id 分裂成两个调用。**空串不是 id**——`call.id !== undefined` 与 `== null` 两种写法都会让续片段的
+  `id:""` 覆盖真 id，`tool_result` 就对不上上游那条调用；现在空串一律视为「没给 id」。
+- **无主续片段只在单块时复用**：PR 原实现无条件复用 `lastToolBlock`，并行两个调用时后续省略
+  `index`+`id` 的片段会把两条调用的参数拼成坏 JSON，还污染已经正确的那一条。现在只有「当前仅一个
+  工具块」才复用，多块时另开新块（归属不可判定时宁可分开，不猜）。
+- **心跳/注释行续命空闲超时**：`iterateSse` 新增 `onData` 回调，收到任何字节就 `deadline.touch()`。
+  旧实现只在产出 chunk 时续命，纯心跳（`: keep-alive`）的长任务会被误判 TIMEOUT。
+- **内置工具让位收窄**：`filterMcpShadowedBuiltins(tools, mcp, requestTools)` 只在**本次请求真的带了**
+  该服务的 `mcp__` 工具时才摘对应内置工具。旧实现只要 MCP 挂着就摘，本次请求没带 MCP 工具时
+  内置搜索被白白弄丢。
+- **HTTP 429 结构化 code 优先（Q2 加强）**：先 `JSON.parse` 取 `error.code ?? code` 再判额度字样。
+  整合复核补回护栏：**JSON 报文只给 `message`（没有 code）时仍按 message 认明确额度字样**——
+  PR 原实现在这种情况下把真终局的额度耗尽降级成 RATE_LIMIT，会白重试两轮且面板不提示。
+
+**验证**：`npm test` **219 项全绿**（新增 6 例：无 index 分片归并、空串 id 不覆盖、并行调用不污染、
+内置工具让位需请求带 MCP 工具、keep-alive 续命真实服务器用例、429 JSON 缺 code 的额度护栏）。
 
 ## v0.7.2（2026-11-25，两层额度分开记账 + MCP 派发按真实单位计费）
 

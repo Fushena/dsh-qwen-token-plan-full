@@ -137,6 +137,78 @@ test('Chat tool-call fragments assemble and replay through DSH',async()=>{
   ])));
   const a=assemble(chunks);assert.equal(a.finish.kind,'tool-calls');assert.equal(a.blocks()[0].arguments,'{"q":"x"}');
 });
+
+test('Chat tool fragments without indexes reuse their call without colliding with indexed calls', async () => {
+  const part = (call) => ({ choices: [{ delta: { tool_calls: [call] } }] });
+  const chunks = await collect(chatToDshChunks(sse([
+    part({ id: 'call_a', function: { name: 'a', arguments: '{"a":' } }),
+    part({ function: { arguments: '1}' } }),
+    part({ index: 0, id: 'call_b', function: { name: 'b', arguments: '{"b":' } }),
+    part({ id: 'call_b', function: { arguments: '2}' } }),
+    { choices: [{ delta: {}, finish_reason: 'tool_calls' }] },
+  ])));
+  const calls = assemble(chunks).blocks();
+  assert.deepEqual(calls.map(({ id, name, arguments: args }) => [id, name, JSON.parse(args)]),
+    [['call_a', 'a', { a: 1 }], ['call_b', 'b', { b: 2 }]]);
+});
+
+test('Chat tool fragments with an empty id keep the real call id (Q13)', async () => {
+  // 续片段带 id:"" 不是「没有 id」：旧写法 `call.id !== undefined`（以及 PR 的 `== null`）
+  // 都会把空串写进 block.id，tool_result 就再也对不上上游那条真实调用。
+  const part = (call) => ({ choices: [{ delta: { tool_calls: [call] } }] });
+  const chunks = await collect(chatToDshChunks(sse([
+    part({ index: 0, id: 'call_real', function: { name: 'a', arguments: '{"a":' } }),
+    part({ index: 0, id: '', function: { arguments: '1}' } }),
+    { choices: [{ delta: {}, finish_reason: 'tool_calls' }] },
+  ])));
+  const deltas = chunks.filter(c => c.type === 'tool-call-delta');
+  assert.deepEqual(deltas.map(c => c.id), ['call_real', 'call_real'],
+    '空串 id 不得覆盖真 id（旧实现第二条退回 call_0 占位 id）');
+  const calls = assemble(chunks).blocks();
+  assert.deepEqual(calls.map(({ id, arguments: args }) => [id, JSON.parse(args)]),
+    [['call_real', { a: 1 }]]);
+});
+
+test('Chat continuation fragments without index/id never merge two parallel calls', async () => {
+  // 并行调用后续片段全省略 index+id 时无法判定归属。宁可新开一块（宿主会看到一条
+  // 参数不全的调用），也不能把两条调用的参数串进同一块——那会产出坏 JSON 且污染
+  // 已经正确的那一条。只有「当前仅一个未闭合工具块」时才允许复用上一块。
+  const part = (call) => ({ choices: [{ delta: { tool_calls: [call] } }] });
+  const chunks = await collect(chatToDshChunks(sse([
+    part({ index: 0, id: 'call_a', function: { name: 'a', arguments: '{"a":1}' } }),
+    part({ index: 1, id: 'call_b', function: { name: 'b', arguments: '{"b":2}' } }),
+    part({ function: { arguments: 'tail' } }),
+    { choices: [{ delta: {}, finish_reason: 'tool_calls' }] },
+  ])));
+  const calls = assemble(chunks).blocks();
+  assert.deepEqual(calls.slice(0, 2).map(({ id, arguments: args }) => [id, args]),
+    [['call_a', '{"a":1}'], ['call_b', '{"b":2}']],
+    '两条已完整的调用参数不得被后续无主片段污染');
+  for (const c of calls.slice(0, 2)) JSON.parse(c.arguments);
+  assert.equal(calls.length, 3, '无主片段自成一块，不并进任何已知调用');
+  assert.equal(calls[2].arguments, 'tail');
+  assert.ok(!['call_a', 'call_b'].includes(calls[2].id), '无主块用占位 id，不冒充真实调用');
+});
+
+test('Qwen only hands built-in search to MCP when the request offers that service tool', async () => {
+  const requests = [];
+  const adapter = new QwenTokenPlanAdapter({
+    ctx: { get: () => ({ resolve: async () => ({ value: 'fixture' }) }) },
+    catalog: { find: () => qwen }, providerId: 'test', displayName: 'test',
+    apiKeyEnv: 'TEST', endpoint: 'https://example.invalid/responses', pluginName: 'test',
+    harnessMode: normalizeHarnessMode(['web_search']),
+    mcp: { readyServices: () => ['EnhancedSearch'] },
+    fetchImpl: async (_url, init) => {
+      requests.push(JSON.parse(init.body).tools);
+      return new Response(sse([{ type: 'response.completed', response: {} }]));
+    },
+  });
+  const mcpTool = { ...tool, name: 'mcp__EnhancedSearch__search_pro' };
+  await collect(adapter.stream(opts()));
+  await collect(adapter.stream(opts({ tools: [mcpTool] })));
+  assert.deepEqual(requests[0], [{ type: 'web_search' }]);
+  assert.deepEqual(requests[1].map(({ type, name }) => [type, name]), [['function', mcpTool.name]]);
+});
 const sseData = (event) => `data: ${JSON.stringify(event)}\r\n\r\n`;
 
 for (const [protocol, parse, payload] of [
