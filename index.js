@@ -75,7 +75,7 @@ export const Config = z.object({
     mode: "normal",
     maxRetries: 2,
     backoff: { initialDelayMs: 1_000, maxDelayMs: 10_000, jitterRatio: 0.1 },
-  }).description("请求重试策略（交给宿主 llm-retry 执行）。跨境每次重试都要重传整段历史，DSH 默认 5 次会把一次抖动放大成分钟级假死，故默认 2 次、退避起点 1000ms。"),
+  }).description("请求重试策略（交给宿主 llm-retry 执行）。跨境每次重试都要重传整段历史，DSH 默认的 5 次会把一次抖动放大成分钟级假死，故默认 2 次、退避起点抬到 1000ms。"),
   // false = 观察-only：不注册 adapter/provider（模型从选择器消失），面板/计数/媒体工具照常。
   // 聊天走手工 provider 时改插件不再中断请求；需要服务端内置工具时保持 true 并手动选本插件模型。
   registerProvider: z.boolean().default(true).description("是否注册模型 provider。false = 观察-only：模型从选择器消失，但面板计数、权益工具、目录补货照常工作（聊天走手工线路时改插件不再中断请求）。"),
@@ -136,7 +136,9 @@ export function apply(ctx, config = {}) {
   const watched = new Set([providerId, ...watchedProviders]);
 
   const overrides = Array.isArray(config.models) ? config.models : [];
-  const excludes = Array.isArray(config.excludeModels) ? config.excludeModels.map(String) : [];
+  const excludes = Array.isArray(config.excludeModels)
+    ? config.excludeModels.map((s) => String(s).trim()).filter(Boolean)
+    : [];
   const refreshMinutes = Number.isFinite(config.catalogRefreshMinutes) && config.catalogRefreshMinutes >= 1
     ? config.catalogRefreshMinutes : 30;
   const tierRefreshHours = Number.isFinite(config.tierRefreshHours) && config.tierRefreshHours >= 0.5
@@ -145,9 +147,7 @@ export function apply(ctx, config = {}) {
   // 出站代理：Node 的 fetch 不读系统代理设置，需要时由配置或环境变量显式指定。
   // 未配置且无环境变量时原样返回原生 fetch —— 行为与改动前完全一致。
   const proxyFetch = createProxyFetch({ proxy: config.proxy, logger: ctx.logger });
-  const proxyLabel = redactProxyUrl(typeof config.proxy === "string" && config.proxy.trim() !== ""
-    ? (proxyFetch === globalThis.fetch ? "" : config.proxy)
-    : proxyFetch.proxyUrl);
+  const proxyLabel = redactProxyUrl(proxyFetch.proxyUrl);
   if (proxyLabel) ctx.logger?.info?.(`${name}: 出站请求经代理 ${proxyLabel}`);
 
   const catalog = new DynamicCatalog({
@@ -360,6 +360,7 @@ export function apply(ctx, config = {}) {
     const budgetStatus = budget.status();
     return {
       ...budgetStatus,
+      serviceQuotasEnabled: config.serviceQuotas !== false,
       // Harness 权益 MCP 通道状态：面板据此标注每项权益此刻花的是「权益额度」还是「Credits」。
       mcp: mcpStatus,
       // 逐项通道：equity = 走 MCP 扣免费额度；credits = 走模型 API 扣 Credits。
@@ -622,6 +623,7 @@ export function apply(ctx, config = {}) {
       stopped = true;
       lifetime.abort();
       relogin.dispose();
+      try { proxyFetch.close?.(); } catch { /* best effort */ }
       clearTimer(catalogTimer);
       clearTimer(tierTimer);
       clearTimer(equityTimer);
