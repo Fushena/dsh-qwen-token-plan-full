@@ -304,10 +304,23 @@ disabledService.serviceQuotasEnabled = false;
 const disabledPanel = renderWith('budget', disabledService);
 assert.ok(!disabledPanel.slice(disabledPanel.indexOf('qtpf-panel')).includes('服务自带额度暂不可用'), '关闭第一层时不报暂不可用');
 
-// 宿主没有 mcpManager：说明原因，而不是静默什么都不显示。
+// 宿主没有 mcpManager：说明原因，而不是静默什么都不显示（兼容 enabled:false 与真实 mcp.status() 的 enabled:true）。
 const noManager = structuredClone(STATUS);
 noManager.mcp = { enabled: false, reason: 'no-manager', servers: [] };
 const noManagerJson = renderWith('budget', noManager);
 assert.ok(noManagerJson.includes('宿主未提供 MCP 服务'), '无 mcpManager 时面板说明原因');
+
+const noManagerEnabled = structuredClone(STATUS);
+noManagerEnabled.mcp = { enabled: true, reason: 'no-manager', keyPresent: false, servers: [] };
+const noManagerEnabledJson = renderWith('budget', noManagerEnabled);
+assert.ok(noManagerEnabledJson.includes('宿主未提供 MCP 服务'), 'enabled:true + reason:no-manager 也必须显示无 MCP 提示');
+assert.ok(!noManagerEnabledJson.includes('未配置百炼按量付费 Key'), 'no-manager 不得被 missing-key 遮盖');
+
+// 第一层快照过期（serviceQuotasFetchedAt > 0 但 serviceQuotasFresh === false）：应提示暂不可用而非静默消失。
+const staleService = structuredClone(noService);
+staleService.serviceQuotasFetchedAt = Date.now() - 3600_000;
+staleService.serviceQuotasFresh = false;
+const staleServicePanel = renderWith('budget', staleService);
+assert.ok(staleServicePanel.slice(staleServicePanel.indexOf('qtpf-panel')).includes('服务自带额度暂不可用'), '快照过期时应提示暂不可用');
 
 console.log('client-smoke: 全部断言通过 ✔');

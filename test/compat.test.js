@@ -475,8 +475,10 @@ test('model API channel neither gates on nor debits the image entitlement',async
     const ctx={get:name=>name==='credentials'?credentials:workingDirectory,tools:{register:def=>{definitions.push(def);return ()=>{};}}};
     const budget={equityState:()=>({key:'image_generation',used:20,quota:20,remaining:0,unit:'张',source:'official'}),
       record:(key,count)=>{recorded.push([key,count]);return null;},recordRequest:()=>{requests.push(1);}};
-    const dispose=registerMediaTools(ctx,{apiKeyEnv:'TEST',pluginName:'test',origin:'https://example.invalid',chatEndpoint:'https://example.invalid/chat',imageModels:['image'],videoModels:['video'],defaultImageModel:'image',defaultVideoModel:'video',budget,fetchImpl:async()=>
-      Response.json({choices:[{message:{content:[{type:'image',image:'https://example.invalid/r.png'}]}}]})});
+    const dispose=registerMediaTools(ctx,{apiKeyEnv:'TEST',pluginName:'test',origin:'https://example.invalid',chatEndpoint:'https://example.invalid/chat',imageModels:['image'],videoModels:['video'],defaultImageModel:'image',defaultVideoModel:'video',budget,fetchImpl:async(url)=>
+      String(url).includes('multimodal-generation')
+        ? Response.json({choices:[{message:{content:[{type:'image',image:'https://example.invalid/r.png'}]}}]})
+        : new Response('x',{headers:{'content-type':'image/png'}})});
     const result=await definitions[0].execute({prompt:'p',n:4},{agent:{},signal:new AbortController().signal});
     assert.equal(result.count,1);
     assert.deepEqual(recorded,[],'模型 API 不扣权益，不得记 image_generation');
@@ -485,11 +487,11 @@ test('model API channel neither gates on nor debits the image entitlement',async
   } finally { rmSync(dir,{recursive:true,force:true}); }
 });
 
-test('MCP channel counts each saved image even when a later download fails', async(t)=>{
+test('MCP channel counts generated images on upstream success even when a download fails', async(t)=>{
   pinPublicDns(t);
-  // 回归（2026-11-13）：旧实现全部下载成功才 record(paths.length)，中途失败/abort
-  // → 已落盘的那几张全漏计 → 额度高估。每张成功即计 1，失败时已成功的仍计入。
-  // 2026-11-23：权益记账搬到 MCP 通道（模型 API 不扣权益），回归口径不变。
+  // 回归（2026-11-13 / 2026-11-26 Q-H8）：上游生成成功即已扣费，不能等下载成功才 record；
+  // 否则下载失败会漏记已产生的上游扣费。无论第几张下载失败，生成的张数都必须记账，
+  // 且下载失败不回落模型 API。
   const dir=mkdtempSync(path.join(os.tmpdir(),'qtpf-img-partial-'));
   try {
     const definitions=[];const recorded=[];
@@ -507,7 +509,7 @@ test('MCP channel counts each saved image even when a later download fails', asy
     const imageTool=definitions[0];
     const exec={agent:{},signal:new AbortController().signal};
     await assert.rejects(imageTool.execute({prompt:'p',n:2},exec),/download boom/);
-    assert.deepEqual(recorded,[['image_generation',1]],'第一张已落盘：失败也必须计入（旧实现 record=[]）');
+    assert.deepEqual(recorded,[['image_generation',2]],'上游已生成 2 张即记 2 张，下载失败不漏记');
     assert.equal(readdirSync(dir).filter(f=>f.startsWith('qwen-image-mcp')).length,1,'第一张确实已落盘');
     dispose();
   } finally { rmSync(dir,{recursive:true,force:true}); }

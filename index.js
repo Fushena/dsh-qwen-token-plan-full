@@ -70,10 +70,12 @@ export const Config = z.object({
   requestTimeoutMs: z.number().min(1_000).default(120_000).description("空闲超时（毫秒，不是总时长）：多久没有新字节算卡死。跨境静默窗口比国内长，60s 会误杀健康请求，故默认 120000。与重试次数成对调：最坏墙钟 = 本值 ×(1 + maxRetries)。"),
   // 请求重试策略（DSH 的 llm-retry 在 provider 配置下读取，见 dsh-llm 的 RetryPolicySchema）。
   // 跨境每次重试都要重新全量上传整段历史，DSH 默认的 5 次会把一次抖动放大成分钟级假死，
-  // 所以这里默认降到 2 次、退避起点抬到 1000ms。
+  // 所以这里默认降到 2 次、退避起点抬到 1000ms；同时把 STREAM_CLOSED 显式纳入可重试码，
+  // 避免跨境代理/网关在终止事件前干净关闭连接（clean EOF）时一次也不重试直接失败。
   retryPolicy: RetryPolicySchema.default({
     mode: "normal",
     maxRetries: 2,
+    retryableCodes: ["EMPTY_RESPONSE", "RATE_LIMIT", "SERVER", "TIMEOUT", "TRANSPORT", "STREAM_CLOSED"],
     backoff: { initialDelayMs: 1_000, maxDelayMs: 10_000, jitterRatio: 0.1 },
   }).description("请求重试策略（交给宿主 llm-retry 执行）。跨境每次重试都要重传整段历史，DSH 默认的 5 次会把一次抖动放大成分钟级假死，故默认 2 次、退避起点抬到 1000ms。"),
   // false = 观察-only：不注册 adapter/provider（模型从选择器消失），面板/计数/媒体工具照常。
@@ -168,11 +170,15 @@ export function apply(ctx, config = {}) {
     budget, logger: ctx.logger, pluginName: name,
   });
 
+  let stopped = false;
+  const lifetime = new AbortController();
+
   // 目录补货器：聊天固定走普通线路时，新模型由这里补进普通线路的名单（见 lib/catalog-feed.js）。
   const feed = config.catalogFeed === false ? null : new CatalogFeed({
     ctx, catalog, feedProvider: String(config.feedProvider || "qwentokenplan"),
     feedReasoning: config.feedReasoning !== false,
     pluginName: name, fetchImpl: proxyFetch, logger: ctx.logger,
+    signal: lifetime.signal,
   });
 
   const adapter = new QwenTokenPlanAdapter({
@@ -193,8 +199,6 @@ export function apply(ctx, config = {}) {
     }]);
   }
 
-  let stopped = false;
-  const lifetime = new AbortController();
   const refreshSignal = () => AbortSignal.any([lifetime.signal, AbortSignal.timeout(30_000)]);
   // 能力探测要独立预算：每个新模型 11 次串行真实生成请求，30s 的目录刷新预算装不下。
   // 2026-11-18 线上实测同一个 qwen4-max-preview：30s → 只发出 10 个请求、maxTokens
@@ -495,24 +499,59 @@ export function apply(ctx, config = {}) {
   let siteTask = null;
   let siteResolved = false;
   let siteRetryAfter = 0;
+  let siteGen = 0;
   // 失败后的重试冷却：没有它，断网时每个请求都要先白等满 15s 探测预算
   // （两个站点各一次），比原来的「只探一次」更慢。30s 与目录刷新同量级。
   const SITE_RETRY_COOLDOWN_MS = 30_000;
   const resolveSite = ({ force = false } = {}) => {
-    if (siteResolved || stopped) return Promise.resolve();
-    // 手动刷新要绕过冷却：用户点「刷新」正是想立刻重试，让他再等 30s 说不通。
-    // 但在途的仍复用同一个 Promise —— 并发点击不该重复打上游。
-    if (force) siteRetryAfter = 0;
-    else if (Date.now() < siteRetryAfter) return Promise.resolve();
-    siteTask ??= detectOnce().then(() => {
-      // detectOnce 内部已把成功/失败写进 siteState；只有拿到 200 才算判定完成。
-      if (siteState.probed) siteResolved = true;
-      else { siteTask = null; siteRetryAfter = Date.now() + SITE_RETRY_COOLDOWN_MS; }
-    }).catch(() => { siteTask = null; siteRetryAfter = Date.now() + SITE_RETRY_COOLDOWN_MS; });
+    if (stopped) return Promise.resolve();
+    if (force) {
+      // 手动刷新或 Key 变更强制重探：解除 siteResolved 固化并绕过冷却；
+      // 若此时无在途探测则启动新探测，并发点击仍复用同一个在途 Promise。
+      siteResolved = false;
+      siteRetryAfter = 0;
+    } else {
+      if (siteResolved) return Promise.resolve();
+      if (Date.now() < siteRetryAfter) return Promise.resolve();
+    }
+    if (!siteTask) {
+      const gen = siteGen;
+      siteTask = detectOnce().then(() => {
+        if (gen !== siteGen) return;
+        // detectOnce 内部已把成功/失败写进 siteState；只有拿到 200 才算判定完成。
+        if (siteState.probed) siteResolved = true;
+        else siteRetryAfter = Date.now() + SITE_RETRY_COOLDOWN_MS;
+      }).catch(() => {
+        if (gen !== siteGen) return;
+        siteRetryAfter = Date.now() + SITE_RETRY_COOLDOWN_MS;
+      }).finally(() => {
+        if (gen === siteGen) siteTask = null;
+      });
+    }
     return siteTask;
   };
   /** 供请求路径用：冷却期内 resolveSite 自己会直接放行，不拿探测预算压住用户这一轮。 */
   const resolveSiteForRequest = () => resolveSite();
+
+  // 热换 Key（CN ↔ INTL）后必须重置 siteResolved 并重探站点，否则 siteResolved 永久短路、
+  // 跨站持续报不可重试 401 AUTH。
+  if (autoEndpoint) {
+    ctx.effect(() => {
+      if (typeof ctx.on !== "function") return () => {};
+      const onCredUpdate = (ref) => {
+        if (stopped || String(ref ?? "") !== apiKeyEnv) return;
+        siteGen += 1;
+        siteResolved = false;
+        siteRetryAfter = 0;
+        siteTask = null;
+        resolveSite({ force: true }).then(() => {
+          if (!stopped) catalogTick();
+        }).catch(() => {});
+      };
+      const off = ctx.on("credentials/reference-updated", onCredUpdate);
+      return () => { try { if (typeof off === "function") off(); else ctx.off?.("credentials/reference-updated", onCredUpdate); } catch { /* best effort */ } };
+    }, "qwen-token-plan-full: site credential watcher");
+  }
 
   // 判定必须挡在**第一个模型请求之前**：国际站 key 在国内站一律 401，而 401 不在
   // 可重试码里（DEFAULT_RETRYABLE_CODES），漏一轮就是整轮直接失败、llm-retry 也不救。
@@ -580,7 +619,10 @@ export function apply(ctx, config = {}) {
             // 点徽标就会走这条路由，无条件 reprobe 等于每开一次面板就对每个新模型
             // 重打 11 次**真实生成**请求 —— 那是花用户的 Credits 买同一个答案。
             const incomplete = String(catalog.lastError ?? "").includes("probe-incomplete");
-            await Promise.allSettled([refreshTier(), refreshCatalog({ reprobe: incomplete, foreground: true }), refreshEquities(), ...(feed ? [feed.run()] : [])]);
+            // feed.run() 必须在 refreshCatalog() 落定之后执行，避免读到刷新前的旧目录。
+            const catalogTask = refreshCatalog({ reprobe: incomplete, foreground: true });
+            const catalogThenFeed = feed ? catalogTask.catch(() => {}).then(() => feed.run()) : catalogTask;
+            await Promise.allSettled([refreshTier(), catalogThenFeed, refreshEquities()]);
             return json(res, 200, statusPayload());
           }
           // 补货触发端点：定时端经回环 POST 到这里，edit 跑在 HTTP 的干净异步上下文，
