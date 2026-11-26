@@ -141,7 +141,7 @@ test('不含空行的超大流被判协议损坏，而不是无限吃内存', { 
   const body = new ReadableStream({ start(c) { for (let i = 0; i < 40; i += 1) c.enqueue(chunk); c.close(); } });
   await assert.rejects(
     () => (async () => { for await (const _ of iterateSse(body, undefined)) { /* drain */ } })(),
-    (error) => { assert.equal(error.code, 'STREAM_CLOSED'); return true; },
+    (error) => { assert.equal(error.code, 'MALFORMED_RESPONSE'); return true; },
   );
 });
 

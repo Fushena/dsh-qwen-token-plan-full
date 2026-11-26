@@ -77,11 +77,13 @@ test("Shared #1: route-guard enforces loopback remoteAddress, rejects wildcard b
     false,
   );
 
-  // Wildcard bind hosts rejected.
+  // Wildcard bind hosts: non-loopback Host/peer rejected, but loopback 127.0.0.1 still allowed.
   assert.equal(trustedRouteRequest({ headers: { host: "0.0.0.0:49419" } }, "0.0.0.0"), false);
   assert.equal(trustedRouteRequest({ headers: { host: "[::]:49419" } }, "::"), false);
-  assert.equal(trustedRouteRequest({ headers: { host: "127.0.0.1:49419" } }, "0.0.0.0"), false);
-  assert.equal(trustedRouteRequest({ headers: { host: "127.0.0.1:49419" } }, "::"), false);
+  assert.equal(trustedRouteRequest({ headers: { host: "192.168.1.5:49419" } }, "0.0.0.0"), false);
+  assert.equal(trustedRouteRequest({ socket: { remoteAddress: "192.168.1.5" }, headers: { host: "127.0.0.1:49419" } }, "0.0.0.0"), false);
+  assert.equal(trustedRouteRequest({ socket: { remoteAddress: "127.0.0.1" }, headers: { host: "127.0.0.1:49419" } }, "0.0.0.0"), true);
+  assert.equal(trustedRouteRequest({ socket: { remoteAddress: "::1" }, headers: { host: "127.0.0.1:49419" } }, "::"), true);
 
   // sec-fetch-site: array rejected, same-site without Origin rejected, none rejected on POST / allowed on GET & HEAD.
   assert.equal(
@@ -300,6 +302,35 @@ test("Q-H2: ReloginFlow #tick ignores stale initial cookie/ticket and keeps logi
     assert.equal(flow.state().state, "success");
     assert.equal(closed, 1);
     assert.match(fs.readFileSync(path.join(home, ".dsh", ".env"), "utf8"), /login_qianwenai_ticket=fresh_tk/);
+
+    // Also verify #readLocalCookie resolves via ctx.get("credentials") with credentialRef() when .env lacks it.
+    let resolvedRef = null;
+    let pendingTickCred = null;
+    const credCtx = {
+      timeout: (fn) => { pendingTickCred = fn; return () => { pendingTickCred = null; }; },
+      get: (name) => (name === "credentials" ? {
+        resolve: async (ref) => {
+          resolvedRef = ref;
+          return { value: "cna=1; login_qianwenai_ticket=cred_stale_tk" };
+        },
+      } : undefined),
+    };
+    let credHarvest = "cna=2; login_qianwenai_ticket=cred_stale_tk";
+    const flowCred = new ReloginFlow({
+      ctx: credCtx,
+      cookieEnv: "TEST_CK_CRED_ONLY",
+      bridge: { ...bridge, harvestCookie: async () => credHarvest, close: async () => {} },
+      now: () => 1_800_000_000_000,
+    });
+    const startedCred = await flowCred.start({ auto: false });
+    assert.equal(startedCred.ok, true);
+    assert.equal(resolvedRef, "TEST_CK_CRED_ONLY", "must resolve via ctx.get('credentials').resolve(credentialRef(...))");
+    const tCred = pendingTickCred;
+    pendingTickCred = null;
+    tCred();
+    await new Promise((r) => setImmediate(r));
+    assert.equal(flowCred.state().state, "waiting", "stale ticket from credential service must not complete login");
+    flowCred.dispose();
   } finally {
     restore();
   }
@@ -534,8 +565,10 @@ test("Q-H7 & Medium mcp-equity: guard denies over-quota, L1 keeps service mounte
   // Guard allows within L1 capacity (10 <= 10).
   assert.equal(guard({ name: "mcp__TextGenerateSpeech__tts", callId: "t2", arguments: { input: "x".repeat(10) } }), undefined);
   assert.deepEqual(recorded, [["tts", 10]]);
-  // Next call sees freeCapacity 0 -> denied!
+  // Next call sees freeCapacity 0 -> denied AND schedules microtask refresh() to unmount exhausted service!
   assert.ok(guard({ name: "mcp__TextGenerateSpeech__tts", callId: "t3", arguments: { input: "a" } })?.reason);
+  await Promise.resolve();
+  assert.equal(registered.has("TextGenerateSpeech"), false, "exhausted MCP service must be unmounted on microtask after guard denial");
 
   // hostStatusOf catch returns "error" -> service NOT ready -> built-in NOT shadowed.
   listThrows = true;
@@ -587,6 +620,10 @@ test("Q-H7/Q-H8 & Medium media-tools: concurrent reservations, download validati
     await assert.rejects(
       download(async () => new Response('{"Code":"AccessDenied","Message":"expired"}', { status: 200, headers: { "content-type": "application/octet-stream" } }), "https://cdn.test/a.png", dir, "p", "png"),
       /错误页/,
+    );
+    await assert.rejects(
+      download(async () => new Response(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), { status: 200, headers: { "content-type": "image/png", "content-length": "1024" } }), "https://cdn.test/trunc.png", dir, "p", "png"),
+      /截断|Content-Length/,
     );
 
     let redirectBodyCancelled = false;

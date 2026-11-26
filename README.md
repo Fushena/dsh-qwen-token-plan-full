@@ -415,6 +415,16 @@ v0.5.1 起七项权益一一对应七个真实服务，实测全部 `connected`�
 
 真实联网验证需单独进行；正常测试不会运行图片或视频生成。
 
+## v0.7.6（2026-11-26，发布后复核收口）
+
+对 v0.7.5 进行二次逐行复核并与 DSH 宿主真实运行时核对后，修复 5 处残留/边界问题：
+
+- `lib/route-guard.js`：移除过早拦截通配绑定（`0.0.0.0` / `::`）的分支，使 `webServer.host` 配为通配地址时本机回环（`127.0.0.1` / `::1`）面板请求仍可正常通过，同时继续拒绝非回环来源与非回环 `Host`。
+- `lib/media-tools.js`：`streamBodyToFile()` 增加 `Content-Length` 截断校验，响应体字节数与声明不符时报错并清理残片。
+- `lib/relogin.js`：`#readLocalCookie()` 改用 `ctx.get("credentials").resolve(credentialRef(this.#cookieEnv))`，修复凭据仅存于宿主凭据服务（不在 `~/.dsh/.env`）时无法读取初始旧票据的问题。
+- `lib/responses-sse.js`：SSE 单事件超出 32 MB 缓冲上限时改为抛出不可重试的 `MALFORMED_RESPONSE`（此前抛 `STREAM_CLOSED` 在开启断流重试后会被无意义重试）。
+- `lib/mcp-equity.js`：`tools.guard` 因剩余容量为 0 拦截调用时，通过微任务立即触发 `refresh()` 卸载已耗尽的 MCP 服务。
+
 ## v0.7.5（2026-11-26，全量深度审计整改：12 项高危 + 13 项中危 + 17 例回归测试）
 
 对 v0.7.4 进行全源码逐行深度审计，集中修复安全、计费防超额、登录闭环、能力探测、协议健壮性与面板状态缺陷：
