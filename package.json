@@ -1,6 +1,6 @@
 {
   "name": "dsh-qwen-token-plan-full",
-  "version": "0.7.3",
+  "version": "0.7.4",
   "description": "Qwen Token Plan 全能路由：动态模型目录 + Responses/Chat 双协议 + 服务端内置工具（等级自动上限） + 百炼 MCP 权益通道（真扣权益额度） + 两层免费额度面板与当前扣减层 + 图片/语音/视频生成（语音自动落盘给文件）",
   "type": "module",
   "main": "index.js",

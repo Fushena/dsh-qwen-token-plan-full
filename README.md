@@ -399,7 +399,7 @@ v0.5.1 起七项权益一一对应七个真实服务，实测全部 `connected`�
 
 ### 本地验证
 
-在插件目录执行 `npm test`（219 项：compat + relogin + stream + tier-retry + route-guard + model-display + catalog-feed + observer + capability-probe + config-knobs + stream-resilience + probe-integrity + media-safety + budget-merge + mcp-equity + quota-layers + tts，含媒体下载 SSRF/重定向、流内错误分类（Chat 与 Responses 两条路线）、HTTP 429 与额度措辞的优先级、探测完整性、跨实例预算合并、纯文本生图端点回归、MCP 权益通道挂/摘与双通道计费口径、**MCP 派发按真实单位记账（字符/张/秒）与 asr 秒数在 `tools/result` 补记**、两层额度与扣减层判定、**第一层免费额度不虚扣第二层权益（含跨层拆分与周期翻页）**、语音合成落盘与按字符记账、**Chat 工具调用分片归并（空串 id 不覆盖、并行不污染）、SSE 心跳续命、内置工具让位需本次请求带 MCP 工具**）。runner 逐文件串行执行（Windows 上唯一全绿的组合，见 `test/run.mjs` 注释）。另有 `test/client-smoke.mjs` 单独跑（面板渲染桩，不在 runner 内；含来源标签与权益通道断言：缺 Key 时全标 Credits 且给出凭据名、连通项按扣减层标注、无 mcpManager 时说明原因；以及 v0.6.0 的两层断言：两小节并列且顺序与抵扣顺序一致、两层各自的真实数字、第一层耗尽转标套餐权益、第一层缺数据时不谎报、视频 10 秒试用按秒显示；v0.6.2 追加：第一层用尽行整行隐去、全部用尽时整节隐去、用尽与取数失败严格区分）。
+在插件目录执行 `npm test`（18 个测试文件共 235 项：compat + relogin + stream + tier-retry + route-guard + model-display + catalog-feed + observer + capability-probe + config-knobs + stream-resilience + probe-integrity + media-safety + budget-merge + mcp-equity + quota-layers + tts + audit-medium-low，含媒体下载 SSRF/重定向、流内错误分类（Chat 与 Responses 两条路线）、HTTP 429 与额度措辞的优先级、探测完整性、跨实例预算合并与第一层三元组原子合并、纯文本生图端点回归、MCP 权益通道挂/摘与耗尽即时卸载、**MCP 派发按真实单位记账（字符/张/秒）与 asr 秒数在 `tools/result` 补记**、两层额度与扣减层判定、**第一层免费额度不虚扣第二层权益（含跨层拆分与周期翻页）**、语音合成落盘与按字符记账、**Chat 工具调用分片归并（空串 id/空 name 不覆盖、并行不污染、tool 先于 user 排序）、SSE 心跳续命、内置工具让位需本次请求带 MCP 工具**）。runner 逐文件串行执行（Windows 上唯一全绿的组合，见 `test/run.mjs` 注释）。另有 `test/client-smoke.mjs` 单独跑（面板渲染桩，不在 runner 内；含来源标签与权益通道断言：缺 Key 时全标 Credits 且给出凭据名、连通项按扣减层标注、无 mcpManager 时说明原因；以及 v0.6.0 的两层断言：两小节并列且顺序与抵扣顺序一致、两层各自的真实数字、第一层耗尽转标套餐权益、第一层缺数据时不谎报、视频 10 秒试用按秒显示；v0.6.2 追加：第一层用尽行整行隐去、全部用尽时整节隐去、用尽与取数失败严格区分；v0.7.4 追加：关闭第一层或已拉取为空时不误报暂不可用）。
 
 下载类用例把 DNS 钉在 mock 上（`pinPublicDns`）：本机 DNS 会把 `*.invalid` 泛解析到
 `198.18.x.x`（RFC 2544 基准段，属 SSRF 闸的内网地址），不钉死就会随网络环境随机失败。
@@ -414,6 +414,28 @@ v0.5.1 起七项权益一一对应七个真实服务，实测全部 `connected`�
 测试使用本机已安装的 DeepSeek Harness 内置运行时与真实 `dsh-llm` 类，不访问网络、不读取个人凭据。其他安装路径可通过 `DSH_TEST_NODE` 和 `DSH_TEST_RUNTIME` 指定。
 
 真实联网验证需单独进行；正常测试不会运行图片或视频生成。
+
+## v0.7.4（2026-11-26，高/中/低危全量审计修复 + 回归测试补齐）
+
+整合 `fix/high-severity-audit-bugs` 分支，集中修复预算合并、目录探测、Chat 编解码、MCP 耗尽卸载及各模块中低危审计缺陷：
+
+- **高危修复（5 项）**：
+  - `lib/budget.js`：区分 `periodAnchorSource`（权威回源 vs 估算 `+30d`），防止估算锚点拒绝真实网关 `setTier()` 更新；全周期分支原子合并第一层 `serviceQuotas` 三元组，杜绝新旧快照字段混拼或回退。
+  - `lib/catalog.js`：GLM Chat 模型跳过 `/responses` 探测，并保留已探测模型的家族专属 `transport`、`contextWindow` 与 `harnessTools`。
+  - `lib/chat.js`：流式 `tool_calls` 续传分片忽略空串 / `null` 的 `function.name`，防止覆盖真实工具名。
+  - `lib/mcp-equity.js` & `lib/media-tools.js`：本地 `budget.record()` 耗尽任一权益后立即调用 `mcp.refresh()` 卸载对应 MCP 服务（覆盖 `tools/result`、`saveMcpImages`、`speechTool`），消除最多 10 分钟的耗尽空窗。
+- **中/低危修复**：
+  - `lib/capability-probe.js`：探测显式发 `reasoning.effort="none"`、兼容 CRLF SSE 错误、非推理模型正确标记 `reasoning=false`。
+  - `lib/mcp-equity.js`：`asrSecondsFromResult` 避免重复计数与元数据膨胀；补齐 `MCP_HOSTS.qianwen` 与尾部斜杠归一。
+  - `lib/relogin.js`：自动创建 `~/.dsh`、更新陈旧 env、`start()` 并发去重、`dispose()` 干净停止。
+  - `lib/media-tools.js`：预检合并计入第一层 + 第二层剩余容量，并兼容提取 JSON 转义后的图片 URL。
+  - `lib/catalog-feed.js`：目录重排后按模型 `id` 重新定位，修复为非推理模型时清理陈旧 `compat`。
+  - `lib/site.js`：`detectSite` 在 `intl` 落地时才开始国内站宽限计时（而非从 `t=0` 起算）。
+  - `lib/client.js`：关闭第一层或已成功拉取为空时不误报「暂不可用」；切走非本 provider（`!mine`）时自动收起面板。
+  - `lib/chat.js`：忽略空的 `finish_reason`；`chatMessages` 保证 `role: "tool"` 排在尾随 `role: "user"` 之前。
+  - `lib/budget.js`：`setEquities(null)` / `setServiceQuotas(null)` 保留既有缓存；`setTierFallback` 清理不匹配的 `planUsagePercent`。
+
+**验证**：`npm test` 18 个测试文件 **235 项全绿**（新增 `test/audit-medium-low.test.js` 等 16 例），`node test/client-smoke.mjs` 全部断言通过。
 
 ## v0.7.3（2026-11-25，整合 codex PR #2：工具调用归并 + 心跳续命 + 内置工具让位收窄）
 

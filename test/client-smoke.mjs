@@ -284,6 +284,7 @@ assert.ok(partialPlan.includes('qtpf-src equity'), '用尽项的扣减层落到�
 // 第一层取数失败：不画空表，给可操作提示，第二层照常显示（能力没断）。
 const noService = structuredClone(STATUS);
 noService.serviceQuotas = [];
+noService.serviceQuotasFetchedAt = null;
 delete noService.chargeSources;
 delete noService.chargeLayers;
 const noServiceJson = renderWith('budget', noService);
@@ -292,6 +293,16 @@ assert.ok(noServicePanel.includes('服务自带额度暂不可用'), '第一层�
 assert.ok(noServicePanel.includes('14/20张'), '第一层缺失时第二层仍完整显示');
 assert.ok(!noServicePanel.includes('qtpf-src service'), '无第一层数据时不谎报在扣服务额度');
 assert.ok(!noServicePanel.includes('当前扣减'), '两层都无判定依据时不显示扣减提示');
+
+// 第一层已成功拉取但账号无试用项，或配置已关闭：隐去提示，不误报取数失败。
+const emptyFetched = structuredClone(noService);
+emptyFetched.serviceQuotasFetchedAt = Date.now();
+const emptyFetchedPanel = renderWith('budget', emptyFetched);
+assert.ok(!emptyFetchedPanel.slice(emptyFetchedPanel.indexOf('qtpf-panel')).includes('服务自带额度暂不可用'), '已成功拉取且为空时不报暂不可用');
+const disabledService = structuredClone(noService);
+disabledService.serviceQuotasEnabled = false;
+const disabledPanel = renderWith('budget', disabledService);
+assert.ok(!disabledPanel.slice(disabledPanel.indexOf('qtpf-panel')).includes('服务自带额度暂不可用'), '关闭第一层时不报暂不可用');
 
 // 宿主没有 mcpManager：说明原因，而不是静默什么都不显示。
 const noManager = structuredClone(STATUS);
