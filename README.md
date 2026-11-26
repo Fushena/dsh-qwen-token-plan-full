@@ -399,7 +399,7 @@ v0.5.1 起七项权益一一对应七个真实服务，实测全部 `connected`�
 
 ### 本地验证
 
-在插件目录执行 `npm test`（18 个测试文件共 235 项：compat + relogin + stream + tier-retry + route-guard + model-display + catalog-feed + observer + capability-probe + config-knobs + stream-resilience + probe-integrity + media-safety + budget-merge + mcp-equity + quota-layers + tts + audit-medium-low，含媒体下载 SSRF/重定向、流内错误分类（Chat 与 Responses 两条路线）、HTTP 429 与额度措辞的优先级、探测完整性、跨实例预算合并与第一层三元组原子合并、纯文本生图端点回归、MCP 权益通道挂/摘与耗尽即时卸载、**MCP 派发按真实单位记账（字符/张/秒）与 asr 秒数在 `tools/result` 补记**、两层额度与扣减层判定、**第一层免费额度不虚扣第二层权益（含跨层拆分与周期翻页）**、语音合成落盘与按字符记账、**Chat 工具调用分片归并（空串 id/空 name 不覆盖、并行不污染、tool 先于 user 排序）、SSE 心跳续命、内置工具让位需本次请求带 MCP 工具**）。runner 逐文件串行执行（Windows 上唯一全绿的组合，见 `test/run.mjs` 注释）。另有 `test/client-smoke.mjs` 单独跑（面板渲染桩，不在 runner 内；含来源标签与权益通道断言：缺 Key 时全标 Credits 且给出凭据名、连通项按扣减层标注、无 mcpManager 时说明原因；以及 v0.6.0 的两层断言：两小节并列且顺序与抵扣顺序一致、两层各自的真实数字、第一层耗尽转标套餐权益、第一层缺数据时不谎报、视频 10 秒试用按秒显示；v0.6.2 追加：第一层用尽行整行隐去、全部用尽时整节隐去、用尽与取数失败严格区分；v0.7.4 追加：关闭第一层或已拉取为空时不误报暂不可用）。
+在插件目录执行 `npm test`（19 个测试文件共 252 项：compat + relogin + stream + tier-retry + route-guard + model-display + catalog-feed + observer + capability-probe + config-knobs + stream-resilience + probe-integrity + media-safety + budget-merge + mcp-equity + quota-layers + tts + audit-medium-low + deep-audit-fixes，含媒体下载 SSRF/重定向/0字节与错误页拒收、流内错误分类（Chat 与 Responses 两条路线）、HTTP 429 与额度措辞的优先级、探测完整性与流内限流防毒化、跨实例预算合并与第一层三元组原子合并、纯文本生图端点回归、MCP 权益通道挂/摘与超额派发拦截、**MCP 派发按真实单位记账（字符/张/秒）与 asr 秒数在 `tools/result` 补记**、两层额度与扣减层判定、**第一层免费额度不虚扣第二层权益（含跨层拆分与周期翻页）**、语音合成落盘与按字符记账、**Chat 工具调用分片归并（空串 id/空 name 不覆盖、并行不污染、tool 先于 user 排序）、SSE 心跳续命、内置工具让位需本次请求带 MCP 工具**）。runner 逐文件串行执行（Windows 上唯一全绿的组合，见 `test/run.mjs` 注释）。另有 `test/client-smoke.mjs` 单独跑（面板渲染桩，不在 runner 内；含来源标签与权益通道断言：缺 Key 时全标 Credits 且给出凭据名、连通项按扣减层标注、无 mcpManager 时说明原因；以及 v0.6.0 的两层断言：两小节并列且顺序与抵扣顺序一致、两层各自的真实数字、第一层耗尽转标套餐权益、第一层缺数据时不谎报、视频 10 秒试用按秒显示；v0.6.2 追加：第一层用尽行整行隐去、全部用尽时整节隐去、用尽与取数失败严格区分；v0.7.4 追加：关闭第一层或已拉取为空时不误报暂不可用；v0.7.5 追加：`McpBlock` `no-manager` 提示与 `serviceQuotasFresh` 过期判定断言）。
 
 下载类用例把 DNS 钉在 mock 上（`pinPublicDns`）：本机 DNS 会把 `*.invalid` 泛解析到
 `198.18.x.x`（RFC 2544 基准段，属 SSRF 闸的内网地址），不钉死就会随网络环境随机失败。
@@ -414,6 +414,28 @@ v0.5.1 起七项权益一一对应七个真实服务，实测全部 `connected`�
 测试使用本机已安装的 DeepSeek Harness 内置运行时与真实 `dsh-llm` 类，不访问网络、不读取个人凭据。其他安装路径可通过 `DSH_TEST_NODE` 和 `DSH_TEST_RUNTIME` 指定。
 
 真实联网验证需单独进行；正常测试不会运行图片或视频生成。
+
+## v0.7.5（2026-11-26，全量深度审计整改：12 项高危 + 13 项中危 + 17 例回归测试）
+
+对 v0.7.4 进行全源码逐行深度审计，集中修复安全、计费防超额、登录闭环、能力探测、协议健壮性与面板状态缺陷：
+
+- **安全加固**：
+  - `lib/bridge-client.js`：`Storage.getCookies` 兜底严格按 `CONSOLE_URLS` 域名与未过期条件过滤并防控制字符注入，杜绝全站 Cookie 外泄；`findConsoleTab()` 改为精确 origin 校验与有限数字 tabId 检查。
+  - `lib/route-guard.js`：校验 `req.socket.remoteAddress` 为回环地址、拒通配绑定（`0.0.0.0`/`::`）、支持裸 IPv6 绑定、拒数组型 `sec-fetch-site` 与 `same-site`、严校验 `Host`/`Origin` 无 userinfo/path。
+  - `lib/proxy.js`：`redactProxyUrl()` 拒绝无协议头的 opaque scheme（如 `user:secret@host:port`）防止明文密码打入日志；`proxyFetch.proxyUrl` 改为存储脱敏后地址。
+  - `lib/media-tools.js`：SSRF 补齐 `0.0.0.0/8`、`240.0.0.0/4`、`*.localhost`、IPv6 `ff00::/8`、NAT64 `64:ff9b::/96`、`::ffff:0:0/96`，并在重定向被拒前及时 `cancel()` 响应体。
+- **登录闭环与凭据保护**：
+  - `lib/relogin.js`：`#tick()` 忽略与初始失效 Cookie / 票据相同的值，修复 3 秒内误关登录页死循环；`updateEnvFile()` 仅忽略 `ENOENT`（避免瞬时读错清空 `~/.dsh/.env` 全部密钥）、校验 `envName`、清理重复同名行并使用随机临时文件原子写入。
+  - `lib/gateway.js`：`readConsoleCookie()` 改为仅成对剥离首尾引号，避免截断 RFC 6265 引号 Cookie；`callOpenApi()` 校验 HTTP 200 逻辑失败标志与错误码，防止瞬断清空第一层缓存。
+- **账本准确性与防超额付费**：
+  - `lib/budget.js`：`setEquities()` / `setServiceQuotas()` 合并磁盘后再对齐 `usedAtFetch` 消除跨实例双扣；`#mergeWithDisk()` 将 `periodAnchor === 0` 视为同周期采纳非零锚点；`setTierFallback()` 保留已知 `pro`/`lite` 等级；`setTier()` 跨真实周期推进时清空旧周期 `byEquity`；新增 `serviceQuotasFresh` 状态字段。
+  - `lib/mcp-equity.js` & `lib/media-tools.js`：`tools.guard` 按合并一/二层余量拦截超额派发；`qwen_generate_image`/`qwen_generate_speech` 引入在途额度预留防止并行调用穿透付费；`shouldMountService`/`usesEquity` 纳入第一层余量；`rearm()` 加序号守卫；`equityUnitsForDispatch()` 兼容上游字段别名；`hostStatusOf()` 异常不再误判为 `"connected"`。
+  - `lib/media-tools.js`：`download()` 拒绝 0 字节及非媒体 `Content-Type`/HTML/JSON 错误页；`extractMcpImages()` / `saveMcpImages()` 去重且 `urls` 优先于 `inline`、统一 `http://*.aliyuncs.com → https://`（清理 `:80`）并在上游生图返回后立即记账。
+- **协议、探测、目录与面板**：
+  - `index.js` & `lib/capability-probe.js`：`retryPolicy.retryableCodes` 纳入 `STREAM_CLOSED`；能力探测流内限流/5xx/鉴权错不再判 `"rejected"` 毒化缓存，优先非 `"none"` 默认推理档位；监听 `apiKeyEnv` 凭据变更及 `force: true` 重探站点；`POST /refresh` 改为 `refreshCatalog()` 完成后再跑 `feed.run()`。
+  - `lib/adapter.js` / `lib/chat.js` / `lib/responses-sse.js` / `lib/catalog-feed.js` / `lib/client.js`：`displayModel()` 启用 `model.name || model.id`；Responses 补空串 `call_id` 回退与 `output_item.done` 回填；Chat 按 `id` 优先归并并行 `tool_calls` 并正确映射 `function_call`/带工具 `stop`；`CatalogFeed` 接入 `lifetime.signal`、幽灵 provider 防护、`appliedEntries` 追踪、原子写及 `glm-5.2` `minimal → null`；`client.js` 修复 `McpBlock` `"no-manager"` 死代码、过期第一层提示及请求乱序守卫。
+
+**验证**：`npm test` 19 个测试文件 **252 / 252 项全绿**（新增 `test/deep-audit-fixes.test.js` 17 例），`node test/client-smoke.mjs` 全部断言通过。
 
 ## v0.7.4（2026-11-26，高/中/低危全量审计修复 + 回归测试补齐）
 
