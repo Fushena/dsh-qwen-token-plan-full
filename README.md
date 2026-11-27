@@ -1,6 +1,38 @@
-# dsh-qwen-token-plan-full — 千问 Token Plan 全能版
+# dsh-qwen-token-plan-full
 
-按你的 Token Plan（个人版）实际权益重写的 DSH Host 插件，是 `dsh-qwen-token-plan-cn-responses` 的全功能替代品：
+**千问 Token Plan 全能版 · Qwen Token Plan Full-Routing Plugin for DeepSeek Harness (DSH 0.2.x)**
+
+[![Release](https://img.shields.io/github/v/release/Fushena/dsh-qwen-token-plan-full?style=flat-square)](https://github.com/Fushena/dsh-qwen-token-plan-full/releases)
+[![DSH](https://img.shields.io/badge/DeepSeek%20Harness-0.2.x-blue?style=flat-square)](#前置条件与平台支持--prerequisites)
+[![License](https://img.shields.io/github/license/Fushena/dsh-qwen-token-plan-full?style=flat-square)](./LICENSE)
+
+---
+
+### 中文简介
+
+面向 **DeepSeek Harness (DSH 0.2.x)** 的阿里云百炼 **Qwen Token Plan（个人版）** 全功能模型路由与权益插件，是旧版 `dsh-qwen-token-plan-cn-responses` 的完整替代品：
+
+- **动态模型目录与能力探测**：内置 14 个模型 + 定时同步线上 `/v1/models`，自动探测视觉输入、输出上限与推理档位；支持国内站 / 国际站自动判定。
+- **双协议与内置工具**：千问 / DeepSeek 系走 Responses API（含 `web_search`、`code_interpreter`、`web_extractor` 等服务端内置工具），GLM 系走 Chat Completions，支持思考强度控制。
+- **百炼 MCP 权益通道**：对接 7 个百炼官方 MCP 服务，用按量付费 Key 真扣套餐权益而非消耗 Credits，按余额自动挂载/卸载。
+- **两层免费额度面板**：实时展示「服务自带免费额度 → Token Plan 权益」双层余量与当前扣减层，支持一键控制台登录同步。
+- **多模态生成工具**：内置 `qwen_generate_image`（生图，MCP/API 双通道）、`qwen_generate_speech`（语音合成自动落盘）、`qwen_generate_video`（视频异步生成与下载）。
+- **稳定与安全**：可配置空闲超时与重试策略、支持 HTTP/HTTPS 出站代理、内置 SSRF/重定向/凭据脱敏防护。
+
+### English Overview
+
+A full-featured **Alibaba Cloud Bailian Qwen Token Plan** provider and entitlement plugin for **DeepSeek Harness (DSH 0.2.x)**, replacing the legacy `dsh-qwen-token-plan-cn-responses` plugin:
+
+- **Dynamic Model Catalog & Capability Probing**: Ships 14 baseline models and syncs live `/v1/models` periodically, automatically probing vision support, output ceilings, and reasoning efforts, with automatic CN/INTL endpoint detection.
+- **Dual Protocol & Server-Side Harness Tools**: Routes Qwen / DeepSeek models over the Responses API (with built-in `web_search`, `code_interpreter`, `web_extractor`, etc.) and GLM models over Chat Completions with thinking-effort control.
+- **Bailian MCP Equity Channel**: Mounts 7 official Bailian MCP services using a pay-as-you-go key so calls consume Token Plan entitlements instead of Credits, dynamically mounting/unmounting by remaining balance.
+- **Two-Layer Free Quota Panel**: Displays both Layer 1 (service free quota) and Layer 2 (Token Plan equity) balances and active deduction layer in the DSH UI, with one-click console login sync.
+- **Multimodal Generation Tools**: Registers `qwen_generate_image`, `qwen_generate_speech` (auto-saved to workspace), and `qwen_generate_video`.
+- **Resilience & Security**: Configurable idle timeout and retry policy, HTTP/HTTPS outbound proxy support, and built-in SSRF, redirect, and credential-redaction guards.
+
+**Quick Install / 快速安装**：在 DSH **Plugins** 页粘贴 `github:Fushena/dsh-qwen-token-plan-full`，或执行 `dsh plugin --profile desktop add github:Fushena/dsh-qwen-token-plan-full`。
+
+---
 
 ## 如何安装 / Installation
 
